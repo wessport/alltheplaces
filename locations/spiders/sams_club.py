@@ -1,73 +1,62 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from scrapy import Spider
 
-import scrapy
-
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, Extras, Fuel, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
 from locations.hours import OpeningHours
 
-DAYS = [
-    'Mo', 'Tu', 'We', 'Th', 'Fr']
 
-
-class SamsClubSpider(scrapy.Spider):
+class SamsClubSpider(Spider):
     name = "sams_club"
-    item_attributes = {'brand': "Sam's Club"}
-    allowed_domains = ['www.samsclub.com']
+    item_attributes = {"brand": "Sam's Club", "brand_wikidata": "Q1972120"}
     start_urls = [
-        'https://www.samsclub.com/api/node/clubfinder/list?distance=10000&nbrOfStores=600&singleLineAddr=78749',
+        "https://www.samsclub.com/api/node/vivaldi/browse/v2/clubfinder/list?singleLineAddr=USA&distance=50000&nbrOfStores=1000"
     ]
-
-    def parse_hours(self, hours):
-        opening_hours = OpeningHours()
-
-        if 'saturdayHrs' in hours:
-            day = 'Sa'
-            open_time = hours['saturdayHrs']['startHr']
-            close_time = hours['saturdayHrs']['endHr']
-            opening_hours.add_range(
-                day=day, open_time=open_time, close_time=close_time, time_format='%H:%M')
-        if 'sundayHrs' in hours:
-            day = 'Su'
-            open_time = hours['sundayHrs']['startHr']
-            close_time = hours['sundayHrs']['endHr']
-            opening_hours.add_range(
-                day=day, open_time=open_time, close_time=close_time, time_format='%H:%M')
-        if 'monToFriHrs' in hours:
-            open_time = hours['monToFriHrs']['startHr']
-            close_time = hours['monToFriHrs']['endHr']
-            for day in DAYS:
-                opening_hours.add_range(
-                    day=day, open_time=open_time, close_time=close_time, time_format='%H:%M')
-
-        return opening_hours.as_opening_hours()
+    requires_proxy = True
 
     def parse(self, response):
-        data = json.loads(response.body_as_unicode())
+        for store in response.json():
+            if store.get("clubAttributes", {}).get("isDeleted") or store.get("clubAttributes", {}).get(
+                "isTemporarilyClosed"
+            ):
+                continue
 
-        for store in data:
-            properties = {
-                'ref': store["id"],
-                'name': store["name"],
-                'addr_full': store["address"]["address1"],
-                'city': store["address"]["city"],
-                'state': store["address"]["state"],
-                'postcode': store["address"]["postalCode"],
-                'country': store["address"]["country"],
-                'lat': store["geoPoint"]["latitude"],
-                'lon': store["geoPoint"]["longitude"],
-                'phone': store["phone"],
-                'extras': {
-                    'amenity:fuel': 'gas' in store['services'],
-                    'amenity:pharmacy': 'pharmacy' in store['services'],
-                    'fuel:propane': 'propane_exchange' in store['services']
-                }
-            }
+            store.update(store.pop("address", {}))
+            store.update(store.pop("geoPoint", {}))
+            store["street_address"] = store.get("address1")
+            item = DictParser.parse(store)
+            item["website"] = f"https://www.samsclub.com/club/{store['id']}"
 
-            hours = self.parse_hours(store["operationalHours"])
+            services = store.get("services", [])
 
-            if hours:
-                properties['opening_hours'] = hours
+            if gas_prices := store.get("gasPrices"):
+                fuel_station = item.deepcopy()
+                fuel_station["ref"] = f"{store['id']}_fuel"
+                fuel_station["extras"] = {}
+                fuel_types = {fuel["name"] for fuel in gas_prices}
+                apply_yes_no(Fuel.OCTANE_87, fuel_station, "UNLEAD" in fuel_types)
+                apply_yes_no(Fuel.OCTANE_89, fuel_station, "MIDGRAD" in fuel_types or "MID CLR" in fuel_types)
+                apply_yes_no(Fuel.OCTANE_91, fuel_station, "PREMIUM" in fuel_types or "PREM CLR" in fuel_types)
+                apply_yes_no(Fuel.DIESEL, fuel_station, "DIESEL" in fuel_types)
+                apply_category(Categories.FUEL_STATION, fuel_station)
+                yield fuel_station
 
-            yield GeojsonPointItem(**properties)
+            club_attrs = store.get("clubAttributes", {})
+            apply_yes_no(Extras.VEHICLE_TYRE_SERVICES, item, "tires_&_batteries" in services)
+            apply_yes_no(Extras.SELF_CHECKOUT, item, club_attrs.get("isScanNGo"))
+            apply_yes_no(Extras.DELIVERY, item, club_attrs.get("isClubEnabledForRegularDelivery"))
+            item["opening_hours"] = self.parse_hours(store.get("operationalHours", {}))
+
+            apply_category(Categories.SHOP_WHOLESALE, item)
+
+            yield item
+
+    def parse_hours(self, hours_data: dict) -> OpeningHours:
+        oh = OpeningHours()
+        if mon_fri := hours_data.get("monToFriHrs"):
+            for day in ["Mo", "Tu", "We", "Th", "Fr"]:
+                oh.add_range(day, mon_fri["startHrs"], mon_fri["endHrs"])
+        if sat := hours_data.get("saturdayHrs"):
+            oh.add_range("Sa", sat["startHrs"], sat["endHrs"])
+        if sun := hours_data.get("sundayHrs"):
+            oh.add_range("Su", sun["startHrs"], sun["endHrs"])
+        return oh

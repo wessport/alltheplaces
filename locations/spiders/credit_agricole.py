@@ -1,87 +1,64 @@
-# -*- coding: utf-8 -*-
 import json
-import re
+from datetime import date
 
-import scrapy
+from scrapy.spiders import SitemapSpider
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.hours import DAYS, OpeningHours
+from locations.structured_data_spider import StructuredDataSpider
 
 
-DAY_MAPPING = {
-    'Monday': 'Mo',
-    'Tuesday': 'Tu',
-    'Wednesday': 'We',
-    'Thursday': 'Th',
-    'Friday': 'Fr',
-    'Saturday': 'Sa',
-    'Sunday': 'Su'
-}
-
-class CreditAgricoleSpider(scrapy.Spider):
+class CreditAgricoleSpider(SitemapSpider, StructuredDataSpider):
     name = "credit_agricole"
-    item_attributes = {'brand': 'Credit Agricole', 'brand_wikidata': 'Q590952'}
+    item_attributes = {"brand": "Crédit Agricole", "brand_wikidata": "Q590952"}
     allowed_domains = ["credit-agricole.fr"]
-    start_urls = [
-        'https://www.credit-agricole.fr/particulier/agence.html',
-    ]
+    sitemap_urls = ["https://www.credit-agricole.fr/robots.txt"]
+    sitemap_rules = [(r"/particulier/agence/[-\w]+/([-\w]+)\.html$", "parse_sd")]
+    wanted_types = ["FinancialService"]
+    time_format = "%H:%M:%S"
 
-    def parse(self, response):
-        urls = response.xpath('//ul[@class="indexCR-list"]/li/a/@href').extract()
+    def post_process_item(self, item, response, ld_data, **kwargs):
+        item["branch"] = item.pop("name").removeprefix("Agence Crédit Agricole ")
 
-        for url in urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_provence)
+        if geodata := response.xpath('//div[@class="npc-sl-strct-map Card js-CardAgencyMap"]/@data-value').get():
+            coords = json.loads(geodata)
+            item["lat"] = coords["latitude"]
+            item["lon"] = coords["longitude"]
 
-    def parse_provence(self, response):
-        province_urls = response.xpath('//ul[@class="alphabetList js-alphabetList"]/li/a/@href').extract()
+        if schedule := response.xpath("//script/text()").re_first(r"const horaires = (\[.*\]);"):
+            item["opening_hours"] = self.parse_opening_hours(json.loads(schedule))
 
-        for province in province_urls:
-            yield scrapy.Request(response.urljoin(province), callback=self.parse_locality)
+        services = [s.lower() for s in response.xpath('//span[@class="npc-sl-strct-srv-card--text "]/text()').getall()]
+        apply_yes_no(
+            Extras.ATM,
+            item,
+            any(("distributeur" in s and "billets" in s) or ("guichet" in s and "automatique" in s) for s in services),
+        )
+        apply_yes_no(Extras.WHEELCHAIR, item, any("accès handicapé" in s for s in services))
+        apply_yes_no(Extras.CASH_IN, item, any("dépôt" in s and "billets" in s for s in services))
+        apply_category(Categories.BANK, item)
 
-    def parse_locality(self, response):
-        locality_urls = response.xpath('//a[@class="storeLoc-selectAgency"]/@href').extract()
+        yield item
 
-        for locality in locality_urls:
-            yield scrapy.Request(response.urljoin(locality), callback=self.parse_location)
-
-    def parse_location(self, response):
-        ref = re.search(r'.+-(.+?)/?(?:\.html|$)', response.url).group(1)
-        try:
-            data = json.loads(response.xpath(
-                '//script[@type="application/ld+json" and contains(text(), "streetAddress")]/text()').extract_first())
-            geodata = json.loads(
-                response.xpath('//div[@class="CardAgencyMap js-CardAgencyMap"]/@data-value').extract_first())
-            properties = {
-                'name': data["Name"],
-                'ref': ref,
-                'addr_full': data["address"]["streetAddress"],
-                'city': data["address"]["addressLocality"],
-                'postcode': data["address"]["postalCode"],
-                'country': "FR",
-                'phone': data["telephone"],
-                'website': response.url,
-                'lat': float(geodata["latitude"]),
-                'lon': float(geodata["longitude"]),
-            }
-
-            hours = self.parse_hours(data["openingHoursSpecification"])
-            if hours:
-                properties["opening_hours"] = hours
-
-            yield GeojsonPointItem(**properties)
-        except:
-            pass
-
-    def parse_hours(self, hours):
-        opening_hours = OpeningHours()
-
-        for hour in hours:
-            day = hour['dayOfWeek'][0]
-            opening_hours.add_range(day=DAY_MAPPING[day],
-                                    open_time=hour["opens"],
-                                    close_time=hour["closes"],
-                                    time_format='%H:%M:%S')
-
-        return opening_hours.as_opening_hours()
-
-        properties["opening_hours"] = self.parse_hours(data["openingHoursSpecification"])
+    @staticmethod
+    def parse_opening_hours(schedule: list[dict]) -> OpeningHours:
+        # The schedule lists the coming weeks day by day; the first ordinary day
+        # of each weekday stands for it, a bank holiday does not.
+        oh = OpeningHours()
+        seen = set()
+        for day in schedule:
+            weekday = DAYS[date.fromisoformat(day["date"]).weekday()]
+            if weekday in seen or day["type"] not in ("OUVERT", "FERME"):
+                continue
+            seen.add(weekday)
+            for slot in (day.get("matin"), day.get("apresMidi")):
+                # A slot with a typeOuverture is not open to walk-in customers:
+                # by appointment only (OUV_RDV), remote advice only (CONSEIL_DIST)
+                # or temporarily closed (FERM_TEMPO).
+                if slot and not slot.get("typeOuverture"):
+                    oh.add_range(
+                        weekday,
+                        "{heures:02}:{minutes:02}".format(**slot["ouverture"]),
+                        "{heures:02}:{minutes:02}".format(**slot["fermeture"]),
+                    )
+        return oh

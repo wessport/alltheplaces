@@ -1,114 +1,59 @@
-# -*- coding: utf-8 -*-
-import scrapy
 import json
 import re
-from locations.items import GeojsonPointItem
+from datetime import datetime
+from typing import Any
 
-class McDonalsSISpider(scrapy.Spider):
+from scrapy import Spider
+from scrapy.http import Response
 
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS, OpeningHours
+from locations.spiders.mcdonalds import McdonaldsSpider
+
+
+class McdonaldsSISpider(Spider):
     name = "mcdonalds_si"
-    item_attributes = { 'brand': "McDonald's" }
-    allowed_domains = ["www.mcdonalds.si"]
-    start_urls = (
-        'https://www.mcdonalds.si/restavracije/',
-    )
+    item_attributes = McdonaldsSpider.item_attributes
+    start_urls = ["https://www.mcdonalds.si/restavracije"]
 
-    def parse_hour(self, time_str):
-        sh = sm = eh = em = ''
-        match = re.search(r'([0-9]{1,2}):([0-9]{1,2}) - ([0-9]{1,2}):([0-9]{1,2})', time_str)
-        if match:
-            sh, sm, eh, em = match.groups()
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for location in json.loads(re.search(r"docs = (\[.+\])\.map", response.text).group(1)):
+            location.update(location["marker"]["position"])
+            item = DictParser.parse(location)
+            item["branch"] = item.pop("name")
+            item["website"] = location["slugs"]
+            item["image"] = location["thumbnail"]
 
-        return '%02d:%02d-%02d:%02d' % (
-            int(sh),
-            int(sm),
-            int(eh) + 12 if int(eh) < 13 else int(eh),
-            int(em)
-        )
+            try:
+                item["opening_hours"] = self.parse_opening_hours(location.get("hours_shop", []))
+            except:
+                self.logger.error(f'Error parsing opening hours: {location.get("hours_shop", [])}')
 
-    def store_hours(self, data):
-        day_groups = []
-        this_day_group = {}
-        weekdays = ['Mo', 'Th', 'We', 'Tu', 'Fr', 'Sa', 'Su']
-        data = data.xpath('//tr')
-        index = 0
-        for item in data:
-            if index == 7:
-                break
-            day_hour = item.xpath('td[2]/text()').extract_first()
+            # 1: delivery, 2: mcdrive, 3: parking, 4: mccafe, 5: breakfast, 6: student vouchers, 7: birthday, 8: children toys, 9: wifi
+            apply_yes_no(Extras.DRIVE_THROUGH, item, 2 in location["features"])
+            apply_yes_no(Extras.WIFI, item, 9 in location["features"])
+            apply_yes_no(Extras.DELIVERY, item, 1 in location["features"])
 
-            short_day = weekdays[index]
-            hours = self.parse_hour(day_hour)
-            if not this_day_group:
-                this_day_group = {
-                    'from_day': short_day,
-                    'to_day': short_day,
-                    'hours': hours,
-                }
+            if 4 in location["features"]:
+                mccafe = item.deepcopy()
+                mccafe["ref"] = "{}-mccafe".format(item["ref"])
+                mccafe["brand"] = "McCafé"
+                mccafe["brand_wikidata"] = "Q3114287"
+                apply_category(Categories.CAFE, mccafe)
+                yield mccafe
 
-            elif hours == this_day_group['hours']:
-                this_day_group['to_day'] = short_day
+            apply_category(Categories.FAST_FOOD, item)
+            yield item
 
-            elif hours != this_day_group['hours']:
-                day_groups.append(this_day_group)
-                this_day_group = {
-                    'from_day': short_day,
-                    'to_day': short_day,
-                    'hours': hours,
-                }
-
-            index = index + 1
-
-        day_groups.append(this_day_group)
-
-        if not day_groups:
-            return None
-        opening_hours = ''
-        if len(day_groups) == 1 and not day_groups[0]:
-            return None
-        if len(day_groups) == 1 and day_groups[0]['hours'] in ('00:00-23:59', '00:00-00:00'):
-            opening_hours = '24/7'
-        else:
-            for day_group in day_groups:
-                if day_group['from_day'] == day_group['to_day']:
-                    opening_hours += '{from_day} {hours}; '.format(**day_group)
-                else:
-                    opening_hours += '{from_day}-{to_day} {hours}; '.format(**day_group)
-            opening_hours = opening_hours [:-2]
-
-        return opening_hours
-    
-
-    def parse_data(self, data):
-        name = address = phone = lat = lon = ''
-        data = data.xpath('//div[@id="map"]')
-        name = data.xpath('//@data-title').extract_first()
-        address = data.xpath('//@data-address').extract_first()
-        phone = data.xpath('//@data-tel').extract_first()
-        lat = data.xpath('//@data-map-x').extract_first()
-        lon = data.xpath('//@data-map-y').extract_first()
-        return name, address, phone, lat, lon
-
-    def parse_store(self, response):
-        name, address, phone, lat, lon = self.parse_data(response)
-        properties = {
-            'ref': response.meta['ref'],
-            'phone': phone,
-            'lon': lon,
-            'lat': lat,
-            'name': name,
-            'addr_full': address
-        }
-
-        opening_hours = self.store_hours(response)
-        if opening_hours:
-            properties['opening_hours'] = opening_hours
-
-        yield GeojsonPointItem(**properties)
-
-    def parse(self, response):
-        index = 0
-        stores = response.xpath('//div[@class="header-block"]/h2/a/@href').extract()
-        for store in stores:
-            index = index + 1
-            yield scrapy.Request('https://www.mcdonalds.si' + store, meta={'ref': index}, callback=self.parse_store)
+    def parse_opening_hours(self, rules: list) -> OpeningHours:
+        oh = OpeningHours()
+        for rule in rules:
+            if rule.get("time_from") and rule.get("time_to"):
+                # Deal with mixed formats, e.g., time_from "07:00", time_to "23:00:00"
+                open_time, close_time = [
+                    datetime.strptime(t, "%H:%M:%S").strftime("%H:%M") if t.count(":") == 2 else t
+                    for t in [rule["time_from"], rule["time_to"]]
+                ]
+                oh.add_range(DAYS[rule["day"] - 1], open_time, close_time)
+        return oh

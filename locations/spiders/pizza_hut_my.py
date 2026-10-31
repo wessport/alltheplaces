@@ -1,0 +1,26 @@
+from typing import AsyncIterator
+
+from scrapy import Spider
+from scrapy.http import Request
+
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+
+
+class PizzaHutMYSpider(Spider):
+    name = "pizza_hut_my"
+    item_attributes = {"brand": "Pizza Hut", "brand_wikidata": "Q191615"}
+
+    async def start(self) -> AsyncIterator[Request]:
+        headers = {"Client": "236e3ed4-3038-441a-be5b-417871eb84d4"}
+        yield Request(
+            url="https://apiapse1.phdvasia.com/v1/product-hut-fe/localizations?limit=10000",
+            headers=headers,
+            callback=self.parse,
+        )
+
+    def parse(self, response, **kwargs):
+        for store in response.json()["data"]["items"]:
+            item = DictParser.parse(store)
+            apply_category(Categories.RESTAURANT, item)
+            yield item

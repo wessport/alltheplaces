@@ -1,86 +1,24 @@
-# -*- coding: utf-8 -*-
-import json
-from urllib.parse import urlencode
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
 
-import scrapy
-
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
-
-DAY_MAPPING = {'Monday': 'Mo',
-               'Tuesday': 'Tu',
-               'Wednesday': 'We',
-               'Thursday': 'Th',
-               'Friday': 'Fr',
-               'Saturday': 'Sa',
-               'Sunday': 'Su'}
-
-BASE_URL = 'https://onmyj41p3c.execute-api.us-west-2.amazonaws.com/prod/getStoresByCoordinates?'
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.structured_data_spider import StructuredDataSpider
 
 
-class TMobileUSSpider(scrapy.Spider):
+class TmobileUSSpider(SitemapSpider, StructuredDataSpider):
     name = "tmobile_us"
-    item_attributes = { 'brand': "T-Mobile" }
+    item_attributes = {"brand": "T-Mobile", "brand_wikidata": "Q3511885"}
+    sitemap_urls = ["https://www.t-mobile.com/stores/sitemap.xml"]
+    sitemap_rules = [(r"/stores/[a-z]{2}/t-mobile-[-\w]+/?$", "parse_sd")]
     allowed_domains = ["www.t-mobile.com"]
-    download_delay = 0.2
+    drop_attributes = {"facebook", "twitter"}
+    custom_settings = {"ROBOTSTXT_OBEY": False, "CONCURRENT_REQUESTS": 1, "DOWNLOAD_DELAY": 3}
 
-    def parse_hours(self, store_hours):
-        opening_hours = OpeningHours()
-        if store_hours is None:
-            return
-
-        for store_day in store_hours:
-            day = DAY_MAPPING[store_day.get("day")]
-            open_time = store_day.get("opens")
-            close_time = store_day.get("closes")
-            if open_time is None and close_time is None:
-                continue
-            opening_hours.add_range(day=day,
-                                    open_time=open_time,
-                                    close_time=close_time,
-                                    time_format='%H:%M'
-                                    )
-
-        return opening_hours.as_opening_hours()
-
-    def start_requests(self):
-        url = BASE_URL
-
-        with open('./locations/searchable_points/us_centroids_25mile_radius.csv') as points:
-
-            next(points)  # Ignore the header
-            for point in points:
-                _, lat, lon = point.strip().split(',')
-
-                params = {
-                    'latitude': '{}'.format(lat),
-                    'longitude': '{}'.format(lon),
-                    'count': '1000',
-                    'radius': '25',
-                    'ignoreLoadingBar': 'false'
-                }
-
-                yield scrapy.http.Request(url + urlencode(params), callback=self.parse)
-
-    def parse(self, response):
-        data = json.loads(response.body_as_unicode())
-
-        for store in data:
-            properties = {
-                'name': store["name"],
-                'ref': store["id"],
-                'addr_full': store["location"]["address"]["streetAddress"],
-                'city': store["location"]["address"]["addressLocality"],
-                'state': store["location"]["address"]["addressRegion"],
-                'postcode': store["location"]["address"]["postalCode"],
-                'phone': store.get("telephone"),
-                'website': store.get("url") or response.url,
-                'lat': float(store["location"]["latitude"]),
-                'lon': float(store["location"]["longitude"]),
-            }
-
-            hours = self.parse_hours(store.get("hours", []))
-            if hours:
-                properties["opening_hours"] = hours
-
-            yield GeojsonPointItem(**properties)
+    def post_process_item(self, item: Feature, response: Response, ld_data: dict, **kwargs):
+        item["branch"] = item.pop("name").removeprefix("T-Mobile ").removeprefix("at ")
+        item["image"] = (
+            ld_data["image"].split("(webp)")[1].strip("/") if "(webp)" in ld_data["image"] else ld_data["image"]
+        )
+        apply_category(Categories.SHOP_MOBILE_PHONE, item)
+        yield item

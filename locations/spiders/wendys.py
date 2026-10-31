@@ -1,56 +1,58 @@
-import scrapy
-import re
 import json
-from locations.items import GeojsonPointItem
 
-DAY_MAPPING = {
-    'Monday': 'Mo',
-    'Tuesday': 'Tu',
-    'Wednesday': 'We',
-    'Thursday': 'Th',
-    'Friday': 'Fr',
-    'Saturday': 'Sa',
-    'Sunday': 'Su'
-}
+from scrapy import Selector
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Extras, apply_yes_no
+from locations.hours import OpeningHours
+from locations.items import Feature
+from locations.structured_data_spider import StructuredDataSpider
 
 
-class WendysSpider(scrapy.Spider):
-
+class WendysSpider(SitemapSpider, StructuredDataSpider):
     name = "wendys"
-    item_attributes = { 'brand': "Wendy's", 'brand_wikidata': "Q550258" }
-    allowed_domains = ["locations.wendys.com"]
-    download_delay = 0.5
-    download_timeout = 30
-    start_urls = (
-        'https://locations.wendys.com/sitemap.xml',
-    )
+    item_attributes = {"brand": "Wendy's", "brand_wikidata": "Q550258"}
+    wanted_types = ["FastFoodRestaurant"]
+    sitemap_urls = ["https://locations.wendys.com/sitemap.xml"]
+    sitemap_rules = [(r"https://locations.wendys.com/.+/\w\w/.+/.+", "parse_sd")]
+    drop_attributes = {"name", "image"}
 
-    def handle_error(self, failure):
-        self.log("Request failed: %s" % failure.request)
+    def post_process_item(self, item, response, ld_data, **kwargs):
+        item["website"] = ld_data.get("url")
+        item["extras"]["ref:wendys"] = response.xpath("//@data-corporatecode").get()
 
-    def parse_stores(self, response):
-        name = response.xpath('//h1[@class="HeroBanner-title Heading--lead"]/text()').extract_first()
+        # Opening hours for the drive-through seem to get included with regular hours, so clean that up
+        opening_hours_divs = response.xpath('//div[@class="c-location-hours-details-wrapper js-location-hours"]')
+        item["opening_hours"] = self.clean_hours(opening_hours_divs[0])
 
-        properties = {
-            'ref': response.url,
-            'name': name,
-            'addr_full': response.xpath('//meta[@itemprop="streetAddress"]/@content').extract_first(),
-            'city': response.xpath('//meta[@itemprop="addressLocality"]/@content').extract_first(),
-            'state': response.xpath('//abbr[@itemprop="addressRegion"]/text()').extract_first(),
-            'postcode': response.xpath('//span[@itemprop="postalCode"]/text()').extract_first().strip(),
-            'country': response.xpath('//abbr[@itemprop="addressCountry"]/text()').extract_first().strip(),
-            'phone': response.xpath('//span[@itemprop="telephone"]/text()').extract_first(),
-            'opening_hours': '; '.join(response.xpath('//tr[@itemprop="openingHours"]/@content').extract()),
-            'lon': float(response.xpath('//span/meta[@itemprop="longitude"]/@content').extract_first()),
-            'lat': float(response.xpath('//span/meta[@itemprop="latitude"]/@content').extract_first()),
-            'website': response.url,
-        }
+        if len(opening_hours_divs) > 1:
+            item["extras"]["opening_hours:drive_through"] = self.clean_hours(opening_hours_divs[1]).as_opening_hours()
 
-        yield GeojsonPointItem(**properties)
+        if breakfast_hours_divs := response.xpath(
+            '//div[@class="LocationInfo-breakfastInfo js-breakfastInfo"]/span[@class="c-location-hours-today js-location-hours"]'
+        ):
+            item["extras"]["breakfast"] = self.clean_hours(breakfast_hours_divs[0]).as_opening_hours()
 
-    def parse(self, response):
-        response.selector.remove_namespaces()
-        for url in response.xpath('//url/loc/text()').extract():
-            if url.count('/') >= 6:
-                yield scrapy.Request(url, callback=self.parse_stores)
+        yield item
 
+    def extract_amenity_features(self, item: Feature | dict, selector: Selector, ld_item: dict) -> None:
+        if not ld_item.get("amenityFeature"):
+            return
+        apply_yes_no(Extras.WIFI, item, "Wi-Fi" in ld_item["amenityFeature"])
+
+    @staticmethod
+    def clean_hours(hours_div) -> OpeningHours:
+        days = hours_div.xpath(".//@data-days").extract_first()
+        days = json.loads(days)
+
+        oh = OpeningHours()
+
+        for day in days:
+            for interval in day["intervals"] or []:
+                # These interval ranges are 24 hour times represented as integers, so they need to be converted to strings
+                open_time = str(interval["start"]).zfill(4)
+                close_time = str(interval["end"]).zfill(4)
+
+                oh.add_range(day=day["day"].title()[:2], open_time=open_time, close_time=close_time, time_format="%H%M")
+
+        return oh

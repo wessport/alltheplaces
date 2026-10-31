@@ -1,72 +1,49 @@
-# -*- coding: utf-8 -*-
-import json
-import re
-import scrapy
-from scrapy.selector import Selector
+from scrapy.spiders import SitemapSpider
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.categories import Categories, apply_category
+from locations.linked_data_parser import LinkedDataParser
+from locations.structured_data_spider import StructuredDataSpider
 
 
-class WalgreensSpider(scrapy.Spider):
-
+class WalgreensSpider(SitemapSpider, StructuredDataSpider):
     name = "walgreens"
-    allowed_domains = ["www.walgreens.com"]
-    download_delay = 0.1
-    start_urls = (
-        'https://www.walgreens.com/Store-Details.xml',
-    )
+    WALGREENS = {"brand": "Walgreens", "brand_wikidata": "Q1591889"}
+    DUANE_READE = {"brand": "Duane Reade", "brand_wikidata": "Q5310380"}
+    sitemap_urls = ["https://www.walgreens.com/sitemap-storedetails.xml"]
+    sitemap_rules = [("", "parse_sd")]
+    custom_settings = {"DOWNLOAD_DELAY": 2}
 
-    def parse_hours(self, days):
-        opening_hours = OpeningHours()
-        for day in days:
-            opening_hours.add_range(day=day["dayOfWeek"][:2],
-                                    open_time=day["opens"],
-                                    close_time=day["closes"])
+    def pre_process_data(self, ld_data, **kwargs):
+        # Tue Jan 10 -> Tu
+        for rule in ld_data.get("openingHoursSpecification"):
+            if len(rule["dayOfWeek"]) > 2:
+                rule["dayOfWeek"] = rule["dayOfWeek"][:2]
 
-        return opening_hours.as_opening_hours()
+        for department in ld_data.get("department", []):
+            for rule in department.get("OpeningHoursSpecification", []):
+                if len(rule["dayOfWeek"]) > 2:
+                    rule["dayOfWeek"] = rule["dayOfWeek"][:2]
 
-    def parse_store(self, response):
+    def post_process_item(self, item, response, ld_data, **kwargs):
+        if "/locator/walgreens-" in response.url:
+            item.update(self.WALGREENS)
+        elif item["name"] == "Duane Reade":
+            item.update(self.DUANE_READE)
+        # TODO: a few more brands here
 
-        json_data = json.loads(response.xpath('//script[@id="jsonLD"]/text()').extract_first())
+        for department in ld_data.get("department", []):
+            if department.get("@type") == "Pharmacy":
+                item["extras"]["opening_hours:pharmacy"] = LinkedDataParser.parse_opening_hours(
+                    department
+                ).as_opening_hours()
+                break
 
-        try:
-            street_address = json_data["address"]["streetAddress"]
-        except KeyError:
-            return  # invalid store
+        # If there is no retail opening_hours, use the pharmacy hours
+        # If there is a default retail opening_hours, add that to extras
+        if not item.get("opening_hours") and item["extras"].get("opening_hours:pharmacy"):
+            item["opening_hours"] = item["extras"]["opening_hours:pharmacy"]
+        else:
+            item["extras"]["opening_hours:retail"] = item["opening_hours"].as_opening_hours()
 
-        store_id = re.search(r'id=(.*)', response.url).groups()[0]
-
-        store_name = response.xpath('//div[contains(@class, "wag-storedetails-info")]/p/text()').extract()
-        store_name = "".join(store_name)
-        store_name = store_name.replace(u'\xa0', u' ')
-
-        props = {
-            'name': store_name,
-            'addr_full': street_address,
-            'city': json_data["address"]["addressLocality"],
-            'state': json_data["address"]["addressRegion"],
-            'postcode': json_data["address"]["postalCode"],
-            'country': json_data["address"]["addressCountry"],
-            'phone': json_data["telephone"],
-            'ref': store_id,
-            'website': response.url,
-            'opening_hours': self.parse_hours(json_data["openingHoursSpecification"]),
-            'lat': float(json_data["geo"]["latitude"]),
-            'lon': float(json_data["geo"]["longitude"]),
-            'brand': json_data.get("name") or ('Duane Reade' if 'duane' in response.url else 'Walgreens')
-            
-        }
-        return GeojsonPointItem(**props)
-
-    def parse(self, response):
-        xml = Selector(response)
-        xml.remove_namespaces()
-
-        urls = xml.xpath('//loc/text()').extract()
-
-        for url in urls:
-            yield scrapy.Request(
-                response.urljoin(url),
-                callback=self.parse_store
-            )
+        apply_category(Categories.PHARMACY, item)
+        yield item

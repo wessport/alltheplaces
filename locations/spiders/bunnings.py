@@ -1,34 +1,63 @@
-# -*- coding: utf-8 -*-
-import re
 import json
-import scrapy
-from locations.items import GeojsonPointItem
+from typing import Iterable
 
-class BunningsSpider(scrapy.Spider):
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.hours import OpeningHours
+from locations.items import Feature
+
+
+class BunningsSpider(SitemapSpider):
     name = "bunnings"
-    allowed_domains = ["bunnings.com.au"]
-    start_urls = (
-        'https://www.bunnings.com.au/stores/',
-    )
+    requires_proxy = True
+    allowed_domains = ["bunnings.com.au", "bunnings.co.nz"]
+    sitemap_urls = [
+        "https://www.bunnings.com.au/stores.xml",
+        "https://www.bunnings.co.nz/stores.xml",
+    ]
+    sitemap_rules = [(r"/stores/.*/.+$", "parse")]
+    item_attributes = {"brand": "Bunnings Warehouse", "brand_wikidata": "Q4997829"}
 
-    def parse(self, response):
-        raw_data = re.search( "com_bunnings_locations_mapLocations = (.+);", response.text,).group(1)
-        stores = json.loads(raw_data)
+    def parse(self, response: Response) -> Iterable[Feature]:
+        location = json.loads(
+            response.xpath('//script[@id="__NEXT_DATA__" and @type="application/json"]/text()').get()
+        )["props"]["pageProps"]["initialState"]["store"]["data"]
+        item = DictParser.parse(location)
+        item["ref"] = location["name"]
+        item.pop("name", None)
+        item["branch"] = location["displayName"]
+        item["phone"] = location["address"].get("phone")
+        item["email"] = location["address"].get("email")
+        if item["country"] == "NZ":
+            item.pop("state")
+            website_prefix = "https://www.bunnings.co.nz/stores/"
+        else:
+            item["state"] = location["address"]["region"]["isocode"]
+            website_prefix = "https://www.bunnings.com.au/stores/"
+        if "urlRegion" in location:
+            item["website"] = (
+                website_prefix + location["urlRegion"] + "/" + location["displayName"].lower().replace(" ", "-")
+            )
+        item["extras"]["website:map"] = location.get("mapUrl")
 
-        for idx, store in enumerate(stores):
-            store = store['Store']
-            properties = {
-                "lat": store["Location"]["Latitude"],
-                "lon": store["Location"]["Longitude"],
-                "name": store["StoreName"],
-                "addr_full": f'{store["Address"]["Address"]} {store["Address"]["AddressLineTwo"]}'.strip(),
-                "city": store["Address"]["Suburb"],
-                "state": store["Address"]["State"],
-                "postcode": store["Address"]["Postcode"],
-                "country": "AU",
-                "phone": store["Phone"],
-                "website": response.urljoin(store["StoreUrl"]),
-                "ref": idx
+        item["opening_hours"] = OpeningHours()
+        for day in location["openingHours"]["weekDayOpeningList"]:
+            if (
+                not day["closed"]
+                and day.get("openingTime")
+                and day["openingTime"].get("formattedHour")
+                and day.get("closingTime")
+                and day["closingTime"].get("formattedHour")
+            ):
+                item["opening_hours"].add_range(
+                    day=day["weekDay"],
+                    open_time=day["openingTime"]["formattedHour"],
+                    close_time=day["closingTime"]["formattedHour"],
+                    time_format="%I:%M %p",
+                )
 
-            }
-            yield GeojsonPointItem(**properties)
+        apply_category(Categories.SHOP_DOITYOURSELF, item)
+        yield item

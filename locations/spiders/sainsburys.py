@@ -1,57 +1,111 @@
-import json
-import re
-import scrapy
-from locations.items import GeojsonPointItem
-DAYS = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su']
+from typing import Any
 
-class SainsburysSpider(scrapy.Spider):
+from scrapy import Request, Spider
+from scrapy.http import Response
+
+from locations.categories import Categories, Extras, Fuel, PaymentMethods, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS, OpeningHours
+from locations.items import Feature
+from locations.pipelines.address_clean_up import clean_address
+
+
+class SainsburysSpider(Spider):
     name = "sainsburys"
-    item_attributes = { 'brand': "Sainsbury's" }
+    SAINSBURYS = {"brand": "Sainsbury's", "brand_wikidata": "Q152096"}
+    SAINSBURYS_LOCAL = {"brand": "Sainsbury's Local", "brand_wikidata": "Q13218434"}
+    SAINSBURYS_BANK = {"brand": "Sainsbury's Bank", "brand_wikidata": "Q7400525"}
+    item_attributes = SAINSBURYS
     allowed_domains = ["stores.sainsburys.co.uk"]
-    state = True
-    def start_requests(self):
-        headers = {
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Origin': 'https://www.kfc.com',
-            'Accept-Encoding': 'gzip, deflate',
-            'Accept': 'text/javascript, text/html, application/xml, text/xml, */*',
-            'Referer': 'http://locator.safeway.com/sto…edirection=no&mylocation=2706',
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            'X-Requested-With': 'XMLHttpRequest',
-        }
+    start_urls = ["https://api.stores.sainsburys.co.uk/v1/stores/?api_client_id=slfe"]
 
-        for page in range(1000):
-            if(self.state==False):
-                break
-            else:
-                url = 'https://stores.sainsburys.co.uk/api/v1/stores/?fields=slfe-list-2.21&api_client_id=slfe&lat=54.652247&lon=-2.219954&limit=25000000&store_type=main%2Clocal&sort=by_distance&within=1500000&page='+str(page)
-                yield scrapy.Request(
-                    url=url,
-                    callback=self.parse
-                )
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        data = response.json()
 
-    def parse(self, response):
-        data = json.loads(response.body_as_unicode())
+        if len(data["results"]) == 0:
+            return
 
-        if(len(data['results'])==0):
-            self.state = False
+        for store in data["results"]:
+            store.update(store.pop("contact"))
+            store["id"] = store["code"]
+
+            store["street_address"] = clean_address([store["address1"], store["address2"]])
+
+            if store.get("other_name"):
+                store["name"] = store["other_name"]
+
+            item = DictParser.parse(store)
+
+            oh = OpeningHours()
+            for rule in store["opening_times"]:
+                for time in rule["times"]:
+                    oh.add_range(DAYS[rule["day"]], time["start_time"], time["end_time"])
+
+            item["opening_hours"] = oh
+            item["website"] = "https://stores.sainsburys.co.uk/{}/{}".format(
+                item["ref"], item["name"].strip().lower().replace(" ", "-")
+            )
+
+            if "phone" in item and item["phone"] is not None and item["phone"].replace(" ", "").startswith("+443"):
+                item.pop("phone", None)
+
+            yield self.parse_extras(item, store)
+
+        yield Request(
+            url=f'{self.start_urls[0]}&offset={str(int(data["page_meta"]["offset"] + data["page_meta"]["limit"]))}'
+        )
+
+    def parse_extras(self, item: Feature, store: dict) -> Feature:
+        if fhrs := store["fsa_scores"].get("fhrs_id"):
+            item["extras"]["fhrs:id"] = str(fhrs)
+
+        # https://stores.sainsburys.co.uk/api/v1/facilities
+        apply_yes_no(Extras.ATM, item, any(f["id"] == 2 for f in store["facilities"]))
+        apply_yes_no("sells:national_lottery", item, any(f["id"] == 6 for f in store["facilities"]))
+        apply_yes_no(Extras.CAR_WASH, item, any(f["id"] == 30 for f in store["facilities"]))
+        apply_yes_no(Extras.WHEELCHAIR, item, any(f["id"] == 162 for f in store["facilities"]))
+        apply_yes_no(Extras.TOILETS, item, any(f["id"] == 16 for f in store["facilities"]))
+        apply_yes_no(Extras.TOILETS_WHEELCHAIR, item, any(f["id"] == 9 for f in store["facilities"]))
+        apply_yes_no(Extras.BABY_CHANGING_TABLE, item, any(f["id"] == 169 for f in store["facilities"]))
+        apply_yes_no(Extras.WIFI, item, any(f["id"] == 221 for f in store["facilities"]))
+        apply_yes_no(Extras.SELF_CHECKOUT, item, any(f["id"] == 4 or f["id"] == 224 for f in store["facilities"]))
+        if any(f["id"] == 28 for f in store["facilities"]):
+            apply_yes_no(Extras.PARKING_PARENT, item, any(f["id"] == 167 for f in store["facilities"]))
+            apply_yes_no(Extras.PARKING_WHEELCHAIR, item, any(f["id"] == 166 for f in store["facilities"]))
+        apply_yes_no(PaymentMethods.CONTACTLESS, item, any(f["id"] == 104 for f in store["facilities"]))
+
+        if store["store_type"] == "local" or (
+            store["store_type"] == "main" and store["additional_data"]["main_store_branded_as_local"]
+        ):
+            item.update(self.SAINSBURYS_LOCAL)
+            item["branch"] = item.pop("name").removesuffix(" Local")
+            apply_category(Categories.SHOP_CONVENIENCE, item)
+        elif store["store_type"] == "main":
+            item["branch"] = item.pop("name")
+            apply_category(Categories.SHOP_SUPERMARKET, item)
+        elif store["store_type"] == "argos":
+            return None  # ArgosSpider
+        elif store["store_type"] == "pfs":
+            item["branch"] = item.pop("name").removesuffix(" Petrol Station")
+            apply_category(Categories.FUEL_STATION, item)
+            apply_yes_no(Fuel.DIESEL, item, any(f["id"] == 17 for f in store["facilities"]))
+            apply_yes_no(Fuel.LPG, item, any(f["id"] == 192 for f in store["facilities"]))
+            apply_yes_no(Fuel.OCTANE_95, item, any(f["id"] == 11 for f in store["facilities"]))  # "Petrol"
+            apply_yes_no(Fuel.OCTANE_97, item, any(f["id"] == 34 for f in store["facilities"]))  # "Super Unleaded"
+        elif store["store_type"] == "pharmacy":
+            return None  # LloydsPharmacyGBSpider
+        elif store["store_type"] == "tm":
+            item.update(self.SAINSBURYS_BANK)
+            item["branch"] = item.pop("name").removesuffix(" Travel Money")
+            apply_category(Categories.BUREAU_DE_CHANGE, item)
+        elif store["store_type"] == "specsavers":
+            return None  # SpecsaversGBSpider
+        elif store["store_type"] == "restaurant":
+            item["branch"] = item.pop("name").removesuffix(" Cafe")
+            apply_category(Categories.CAFE, item)
+        elif store["store_type"] == "habitat":
+            return None  # https://www.habitat.co.uk/
         else:
-            for store in data['results']:
-                open_hours = store['opening_times']
-                clean_hours = ''
-                for idx, time in enumerate(open_hours):
-                    clean_hours = clean_hours + DAYS[time['day']]+' '+time['start_time']+'-'+time['end_time']+' ; '
-
-                properties = {
-                    "ref": store['code'],
-                    "name": store['name'] ,
-                    "opening_hours": clean_hours,
-                    "website": 'https://stores.sainsburys.co.uk/%s/%s'%(store['code'] , store['other_name'].lower().replace(' ','-')),
-                    "addr_full": store['contact']['address1'],
-                    "city": store['contact']['city'],
-                    "postcode": store['contact']['post_code'],
-                    "country": 'United Kingdom',
-                    "lon": float( store['location']['lon']),
-                    "lat": float(store['location']['lat']),
-                }
-                yield GeojsonPointItem(**properties)
+            item["extras"]["type"] = store["store_type"]
+            self.logger.error("Unmapped type: {}".format(store["store_type"]))
+        return item

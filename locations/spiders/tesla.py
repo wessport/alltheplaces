@@ -1,90 +1,198 @@
-# -*- coding: utf-8 -*-
-import re
-import scrapy
-import urllib.parse
-from locations.items import GeojsonPointItem
+from typing import AsyncIterator, Iterable
+
+import chompjs
+from scrapy import Spider
+from scrapy.http import Request, Response
+from scrapy_zyte_api.responses import ZyteAPITextResponse
+
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.hours import OpeningHours
+from locations.items import Feature
+from locations.user_agents import BROWSER_DEFAULT
 
 
-class TeslaSpider(scrapy.Spider):
+class TeslaSpider(Spider):
     name = "tesla"
-    item_attributes = { 'brand': "Tesla" }
-    allowed_domains = ['www.tesla.com']
-    start_urls = [
-        'https://www.tesla.com/findus/list',
-    ]
-    download_delay = 0.5
-    custom_settings = {
-        'USER_AGENT': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/73.0.3683.86 Safari/537.36',
-    }
+    TESLA_ATTRIBUTES = {"brand": "Tesla", "brand_wikidata": "Q478214"}
+    TESLA_SUPERCHARGER_ATTRIBUTES = {"brand": "Tesla Supercharger", "brand_wikidata": "Q17089620"}
+    requires_proxy = True
+    custom_settings = {"DOWNLOAD_TIMEOUT": 60, "USER_AGENT": BROWSER_DEFAULT, "ROBOTSTXT_OBEY": False}
 
-    def parse(self, response):
-        # Only scrape stores and service centers
-        country_urls = response.xpath('//a[contains(@href,"stores") or contains(@href,"services")]/@href').extract()
-        for country_url in country_urls:
-            yield scrapy.Request(response.urljoin(country_url), callback=self.parse_store_list)
+    DEALER_CATEGORIES = {"sales", "service", "bodyshop", "gallery"}
+    CHARGER_CATEGORIES = {"supercharger", "nacs", "party"}
 
-    def parse_store_list(self, response):
-        store_urls = response.xpath('//a[@class="fn org url"]/@href').extract()
-        for store_url in store_urls:
-            yield scrapy.Request(response.urljoin(store_url), callback=self.parse_store)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.expected_dealers: set[str] = set()
+        self.scraped_dealers: set[str] = set()
+        self.location_discovery_succeeded: bool = False
 
-    def parse_store(self, response):
-        # Skip if "Coming Soon" - no content to capture yet
-        if response.xpath('//span[@class="coming-soon"]/text()').extract_first() == "Coming Soon":
+    async def start(self) -> AsyncIterator[Request]:
+        yield Request(
+            "https://www.tesla.com/api/findus/get-locations?country=US&view=map",
+            callback=self.parse_json_subrequest,
+        )
+
+    def parse_json_subrequest(self, response: Response) -> Iterable[Request]:
+        json_data = self.extract_json(response)
+        locations = self.select_locations(json_data["data"]["data"])
+        if locations:
+            self.location_discovery_succeeded = True
+        for slug, types in locations.items():
+            # Scraping only dealers and chargers within dealers,
+            # since the spider gets blocked after attempting to scrape every charger.
+            if bool(self.DEALER_CATEGORIES.intersection(types)):
+                self.expected_dealers.add(slug)
+                yield Request(
+                    url=f"https://www.tesla.com/api/findus/get-location-details?locationSlug={slug}&functionTypes={','.join(types)}&locale=en_US&isInHkMoTw=false",
+                    callback=self.parse_location,
+                    cb_kwargs={"slug": slug},
+                )
+
+    def parse_location(self, response: Response, slug: str) -> Iterable[Feature]:
+        location = self.extract_json(response)
+        data = location.get("data", {})
+        if data.get("sales_function"):
+            yield self.build_store(data)
+        if data.get("service_function"):
+            yield self.build_service(data)
+        if data.get("supercharger_function"):
+            yield self.build_supercharger(data)
+        if data.get("sales_function") or data.get("service_function"):
+            self.scraped_dealers.add(slug)
+
+    def extract_json(self, response: Response) -> dict | list[dict]:
+        # For some reason, the scrapy_zyte_api library doesn't detect this as a ScrapyTextResponse, so we have to do the text encoding ourselves.
+        # Throws an error when caching is enabled.
+        try:
+            response = ZyteAPITextResponse.from_api_response(response.raw_api_response, request=response.request)
+        except Exception:
             pass
+        if json_data := chompjs.parse_js_object(response.text):
+            return json_data
+        return {}
+
+    def build_store(self, location: dict) -> Feature:
+        item = self.build_item(location)
+        item.update(self.TESLA_ATTRIBUTES)
+        item["website"] = self.parse_url("store", item["ref"])
+        item["ref"] = f"{item['ref']}-STORE"
+        sales = next((f for f in location["functions"] if f["name"] == "Tesla_Center_Sales"), None)
+        if sales:
+            item["name"] = sales["customer_facing_name"]
         else:
-            ref = re.search(r'.+/(.+?)/?(?:\.html|$)', response.url).group(1)
+            gallery = next((f for f in location["functions"] if f["name"] == "Tesla_Center_Gallery"), None)
+            item["name"] = gallery["customer_facing_name"]
+        sales_func = location["sales_function"]
+        if email := self.parse_email(sales_func.get("store_email")):
+            item["email"] = email
+        item["opening_hours"] = self.parse_hours(sales_func.get("business_hours", {}).get("hours", []))
+        if not item.get("phone"):
+            item["phone"] = location["marketing"]["phone_numbers"]
+        apply_category(Categories.SHOP_CAR, item)
+        return item
 
-            # city, state, and zip do not have separate classes - contained together in locality class as text
-            name = response.xpath('normalize-space(//header/h1/text())').extract_first()
-            common_name = response.xpath('normalize-space(//span[@class="common-name"]//text())').extract_first()
-            street_address = response.xpath('normalize-space(//span[@class="street-address"]//text())').extract_first()
-            city_state_zip = response.xpath('normalize-space(//span[@class="locality"]//text())').extract_first()
+    def build_service(self, location: dict) -> Feature:
+        item = self.build_item(location)
+        item.update(self.TESLA_ATTRIBUTES)
+        service = next((f for f in location["functions"] if f["name"] == "Tesla_Center_Service"), None)
+        if service:
+            item["name"] = service["customer_facing_name"]
+            item["website"] = self.parse_url("service", item["ref"])
+        else:
+            collision = next((f for f in location["functions"] if f["name"] == "Tesla_Center_Collision"), None)
+            item["name"] = collision["customer_facing_name"]
+            item["website"] = self.parse_url("bodyshop", item["ref"])
+        service_func = location["service_function"]
+        if email := self.parse_email(service_func.get("service_center_email")):
+            item["email"] = email
+        item["opening_hours"] = self.parse_hours(service_func.get("business_hours", {}).get("hours", []))
+        if not item.get("phone"):
+            item["phone"] = location["marketing"]["service_center_phone"]
+        item["ref"] = f"{item['ref']}-SERVICE"
+        apply_category(Categories.SHOP_CAR_REPAIR, item)
+        return item
 
-            if common_name and street_address and city_state_zip:
-                addr_full = common_name + ' ' + street_address + ', ' + city_state_zip
-            elif street_address and not city_state_zip:
-                addr_full = street_address
-            elif city_state_zip and not street_address:
-                addr_full = city_state_zip
-            elif street_address and city_state_zip:
-                addr_full = street_address + ', ' + city_state_zip
+    def build_supercharger(self, location: dict) -> Feature:
+        item = self.build_item(location)
+        item.update(self.TESLA_SUPERCHARGER_ATTRIBUTES)
+        item["website"] = self.parse_url("supercharger", item["ref"])
+        item["ref"] = f"{item['ref']}-SUPERCHARGER"
+        charger_func = location["supercharger_function"]
+        output = charger_func["installed_full_power"]
+        capacity = charger_func["num_charger_stalls"]
+        ccs_compat = charger_func["open_to_non_tesla"]
+        if not item.get("phone"):
+            item["phone"] = location["marketing"]["roadside_assistance_number"]
+        if ccs_compat:
+            item["extras"]["socket:type2_combo"] = capacity
+            item["extras"]["socket:type2_combo:output"] = output
+        else:
+            item["extras"]["socket:nacs"] = capacity
+            item["extras"]["socket:nacs:output"] = output
+        apply_category(Categories.CHARGING_STATION, item)
+        return item
 
-            country_url = response.xpath('//header[@class="findus-list-header"]/a/@href').extract_first()
-            country = urllib.parse.unquote_plus(re.search(r'.+/(.+?)/?(?:\.html|$)', country_url).group(1))
-            phone = response.xpath('normalize-space(//span[@class="tel"]/span[2]/text())').extract_first()
-            location_type = re.search(r".+/(.+?)/(.+?)/?(?:\.html|$)", response.url).group(1)
+    def build_item(self, location: dict) -> Feature:
+        feature = DictParser.parse(location["key_data"])
+        feature["ref"] = location["marketing"]["location_url_slug"]
+        feature["street_address"] = location["key_data"]["address"]["address_1"]
+        return feature
 
-            # map link varies across store pages
-            if response.xpath('normalize-space(//a[contains(@href,"maps.google")]/@href)').extract_first():
-                map_link = response.xpath('normalize-space(//a[contains(@href,"maps.google")]/@href)').extract_first()
-            else:
-                map_link = response.xpath('normalize-space(//img[contains(@src,"maps.google")]/@src)').extract_first()
+    def parse_email(self, email: str) -> str | None:
+        # Filter internal distribution list emails (DL-* format)
+        if email and not email.startswith("DL-"):
+            return email
 
-            # extract coordinates from map link
-            if re.search(r'.+=([0-9.-]+),\s?([0-9.-]+)', map_link):
-                lat = re.search(r'.+=([0-9.-]+),\s?([0-9.-]+)', map_link).group(1)
-                lon = re.search(r'.+=([0-9.-]+),\s?([0-9.-]+)', map_link).group(2)
-            elif re.search(r'.+@([0-9.-]+),\s?([0-9.-]+)', map_link):
-                lat = re.search(r'.+@([0-9.-]+),\s?([0-9.-]+)', map_link).group(1)
-                lon = re.search(r'.+@([0-9.-]+),\s?([0-9.-]+)', map_link).group(2)
-            else:
-                lat = None
-                lon = None
+    def parse_url(self, location_type: str, slug: str) -> str:
+        return f"https://www.tesla.com/findus/location/{location_type}/{slug}"
 
-            properties = {
-                'ref': ref,
-                'name': name,
-                'addr_full': addr_full,
-                'country': country,
-                'phone': phone,
-                'website': response.url,
-                'lat': lat,
-                'lon': lon,
-                'extras':
-                    {
-                        'location_type': location_type  # Is this a service center or store/gallery
-                    }
-            }
+    def parse_hours(self, hours: list[dict]) -> OpeningHours:
+        try:
+            oh = OpeningHours()
+            for entry in hours:
+                if entry["is_closed"]:
+                    oh.set_closed(entry["day"])
+                else:
+                    oh.add_range(entry["day"], entry["open_hour"], entry["close_hour"])
+            return oh
+        except Exception as e:
+            self.logger.warning("Error parsing {} {}".format(hours, e))
 
-            yield GeojsonPointItem(**properties)
+    # Skip destination chargers as they're not Tesla-operated
+    # Skip if "Coming Soon" - no content to capture yet
+    # Selection only those in categories list
+    # Merge same slugs into one entry, combining types
+    def select_locations(self, locations: list[dict]) -> dict[str, list[str]]:
+        categories = self.DEALER_CATEGORIES | self.CHARGER_CATEGORIES
+        slug_mapping: dict[str, list[str]] = {}
+        for loc in locations:
+            if not isinstance(loc, dict):
+                continue
+            slug = loc.get("location_url_slug")
+            matched = [c for c in loc.get("location_type", []) if c in categories]
+            if not matched or not slug:
+                continue
+            existing = slug_mapping.setdefault(slug, [])
+            for category in matched:
+                if category not in existing:
+                    existing.append(category)
+        return slug_mapping
+
+    def closed(self, reason: str) -> None:
+        expected, scraped = len(self.expected_dealers), len(self.scraped_dealers)
+        missing = sorted(self.expected_dealers - self.scraped_dealers)
+        stats = self.crawler.stats
+        stats.set_value(f"atp/{self.name}/dealers_expected", expected)
+        stats.set_value(f"atp/{self.name}/dealers_scraped", scraped)
+        stats.set_value(f"atp/{self.name}/dealers_missing", len(missing))
+        if not self.location_discovery_succeeded:
+            self.logger.error("Dealer coverage unavailable: location discovery failed")
+        elif missing:
+            self.logger.warning(
+                f"Dealer coverage incomplete ({reason}): {scraped}/{expected} scraped, "
+                f"{len(missing)} missing, first 20: {', '.join(missing[:20])}"
+            )
+        else:
+            self.logger.info(f"Dealer coverage complete: {expected}/{expected} scraped")

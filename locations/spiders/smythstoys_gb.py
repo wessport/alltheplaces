@@ -1,0 +1,12 @@
+from locations.storefinders.woosmap import WoosmapSpider
+
+
+class SmythstoysGBSpider(WoosmapSpider):
+    name = "smythstoys_gb"
+    item_attributes = {"brand": "Smyths", "brand_wikidata": "Q7546779"}
+    key = "woos-49066dab-d11d-3614-98c7-ab241da1565b"
+    origin = "https://www.smythstoys.com/"
+
+    def parse_item(self, item, feature, **kwargs):
+        item["branch"] = item.pop("name")
+        yield item

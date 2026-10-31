@@ -1,66 +1,22 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from typing import Any, Iterable
 
-import scrapy
-from scrapy import Selector
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
 
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.structured_data_spider import StructuredDataSpider
 
 
-class KpmgSpider(scrapy.Spider):
+class KpmgSpider(SitemapSpider, StructuredDataSpider):
     name = "kpmg"
-    request_delay = 4
-    allowed_domains = ['home.kpmg']
-    start_urls = [
-        'https://home.kpmg/bin/kpmg/officesjson?url=xx/en/home/about/offices.html',
-    ]
+    item_attributes = {"brand": "KPMG", "brand_wikidata": "Q493751"}
+    sitemap_urls = ["https://kpmg.com/sitemap-index.xml"]
+    sitemap_rules = [(r"/offices/", "parse_sd")]
+    custom_settings = {"ROBOTSTXT_OBEY": False}
 
-    def parse(self, response):
-        data = json.loads(response.body_as_unicode())
-
-        for country, offices in data.items():
-            cities = offices["cities"]
-            for city in cities:
-                for office in city['offices']:
-                    office_url = Selector(text=office['name']).xpath('//a/@href').extract_first()
-                    properties = {
-                        'addr_full': " ".join([office["streetAdd1"], office["streetAdd2"]]).strip(),
-                        'phone': office['phone'],
-                        'country': country
-                    }
-                    yield scrapy.Request(url=response.urljoin(office_url),
-                                         meta={'properties': properties},
-                                         callback=self.parse_office)
-
-    def parse_office(self, response):
-        properties = response.meta["properties"]
-        lon = response.xpath('//meta[@name="KPMG_Location_Longitude"]/@content').extract_first()
-        lat = response.xpath('//meta[@name="KPMG_Location_Latitude"]/@content').extract_first()
-
-        postcode = response.xpath('//meta[@name="KPMG_Location_Address_Postal_Code"]/@content').extract_first()
-        region = None
-        if postcode:
-            match = re.match(r'([A-Z]{2})(.*)', postcode)
-            if match:
-                region, postcode = match.groups()
-                postcode = postcode.strip('- ')
-
-        properties.update({
-            'brand': 'KPMG',
-            'ref': re.search(r'.+/(.+?)/?(?:\.html|$)', response.url).group(1),
-            'name': response.xpath('//meta[@name="KPMG_Title"]/@content').extract_first(),
-            'city': response.xpath('//meta[@name="KPMG_Location_Mailing_Address_City"]/@content').extract_first(),
-            'website': response.url,
-            'postcode': postcode,
-            'lat': float(lat) if lat else None,
-            'lon': float(lon) if lon else None,
-        })
-
-        country = response.xpath('//meta[@name="KPMG_Location_Country_ISO"]/@content').extract_first()
-        if country:
-            properties["country"] = country
-        if region:
-            properties["state"] = region
-
-        yield GeojsonPointItem(**properties)
+    def post_process_item(self, item: Feature, response: Response, ld_data: dict, **kwargs: Any) -> Iterable[Feature]:
+        if name := item.pop("name", None):
+            item["branch"] = name.removesuffix(" office").strip()
+        apply_category(Categories.OFFICE_CONSULTING, item)
+        yield item

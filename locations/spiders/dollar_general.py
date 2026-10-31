@@ -1,133 +1,50 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-import re
-from locations.items import GeojsonPointItem
+from typing import Any
+
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Categories, apply_category
+from locations.hours import DAYS_FULL, OpeningHours
+from locations.items import Feature
 
 
-WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+class DollarGeneralSpider(SitemapSpider):
+    name = "dollar_general"
+    item_attributes = {
+        "brand": "Dollar General",
+        "brand_wikidata": "Q145168",
+        "country": "US",
+    }
+    allowed_domains = ["dollargeneral.com"]
+    sitemap_urls = ["https://www.dollargeneral.com/sitemap-main.xml"]
+    sitemap_rules = [(r"https:\/\/www\.dollargeneral\.com\/store-directory\/\w{2}\/.*\/\d+$", "parse")]
+    handle_httpstatus_list = [401]  # The server responds with HTTP 401, but the page content is still returned.
 
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        properties = {
+            "street_address": response.xpath("//@data-address").extract_first(),
+            "city": response.xpath("//div[@data-city]/@data-city").extract_first(),
+            "state": response.xpath("//div[@data-state]/@data-state").extract_first(),
+            "postcode": response.xpath("//div[@data-zip]/@data-zip").extract_first(),
+            "lat": response.xpath("//div[@data-latitude]/@data-latitude").extract_first(),
+            "lon": response.xpath("//div[@data-longitude]/@data-longitude").extract_first(),
+            "phone": response.xpath("//div[@data-phone]/@data-phone").extract_first(),
+            "website": response.url,
+            "ref": response.url.rsplit("/", 1)[-1].rsplit(".")[0],
+            "name": self.item_attributes["brand"],
+        }
 
-class DollarGeneralSpider(scrapy.Spider):
-    name = 'dollar_general'
-    item_attributes = { 'brand': "Dollar General" }
-    allowed_domains = ['hosted.where2getit.com']
+        try:
+            properties["opening_hours"] = self.parse_opening_hours(response)
+        except:
+            self.logger.error("Error parsing hours")
 
-    def start_requests(self):
-        url = 'https://hosted.where2getit.com/dollargeneral/rest/locatorsearch?lang=fr_FR'
+        apply_category(Categories.SHOP_VARIETY_STORE, properties)
 
-        with open('./locations/searchable_points/us_centroids_100mile_radius.csv') as points:
-            next(points) # Ignore the header
-            for point in points:
-                row = point.split(',')
-                lat = row[1]
-                lon = row[2]
+        yield Feature(**properties)
 
-                formdata = {
-                    "request": {
-                        "appkey":"9E9DE426-8151-11E4-AEAC-765055A65BB0",
-                        "formdata": {
-                            "geoip": "false",
-                            "dataview":"store_default",
-                            "geolocs": {
-                                "geoloc": [
-                                    {
-                                        "addressline":"",
-                                        "country":"US",
-                                        "latitude":"{}".format(lat),
-                                        "longitude":"{}".format(lon)
-                                    }
-                                ]
-                            },
-                            "searchradius":"100",
-                            "where": {
-                                "nci": {
-                                    "eq":""
-                                },
-                                "or": {
-                                    "PROPANE": {
-                                        "eq":""
-                                    },
-                                    "REDBOX": {
-                                        "eq":""
-                                    },
-                                    "RUGDR": {
-                                        "eq":""
-                                    },
-                                    "MULTICULTURAL_HAIR": {
-                                        "eq":""
-                                    },
-                                    "icon": {
-                                        "eq":""
-                                    },
-                                    "DG_GO": {
-                                        "eq":""
-                                    }
-                                }
-                            },
-                            "false":"0"
-                        }
-                    }
-                }
-
-                headers = {
-                    'Accept': 'application/json, text/javascript, */*; q=0.01',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Content-Type': 'application/json',
-                    'Origin': 'https://hosted.where2getit.com',
-                    'Host': 'hosted.where2getit.com',
-                    'Referer': 'https://hosted.where2getit.com/dollargeneral/',
-                    'X-Requested-With': 'XMLHttpRequest'
-                }
-
-                yield scrapy.http.Request(
-                    url,
-                    self.parse,
-                    method='POST',
-                    body=json.dumps(formdata),
-                    headers=headers,
-                )
-
-    def parse(self, response):
-        result = json.loads(response.body_as_unicode())
-
-        if 'collection' in result['response'].keys():
-            for data in result['response']['collection']:
-                ref = data['uid']
-                lat = data['latitude']
-                lon = data['longitude']
-                name = data['name']
-                state = data['state']
-                street = data['address1']
-                city = data['city']
-                phone = data['phone']
-                opening_hours = self.hours(data)
-                postalcode = 'postalcode' in data.keys() and re.search(r'\d+', data['postalcode']).group() or ''
-
-                properties = {
-                    "phone": phone,
-                    "ref": ref,
-                    "name": name,
-                    "opening_hours": opening_hours,
-                    "lat": lat,
-                    "lon": lon,
-                    "street": street,
-                    "city": city,
-                    "state": state,
-                    "postcode": postalcode
-                }
-
-                yield GeojsonPointItem(**properties)
-
-    def hours(self, data):
-        hours = []
-        for weekday in WEEKDAYS:
-            if 'opening_time_' + weekday.lower() in data.keys():
-                hours.append('{} {}-{}; '.format(
-                    weekday[:2],
-                    data['opening_time_' + weekday.lower()],
-                    data['closing_time_' + weekday.lower()]
-                ))
-
-        return '; '.join(hours)
+    def parse_opening_hours(self, response: Response) -> OpeningHours:
+        oh = OpeningHours()
+        for day in DAYS_FULL:
+            oh.add_range(day, *response.xpath(f"//@data-{day.lower()}").get().split(" - "), "%I:%M %p")
+        return oh

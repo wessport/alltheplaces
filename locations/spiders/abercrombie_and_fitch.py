@@ -1,53 +1,54 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from typing import Iterable
 
-import scrapy
+from scrapy.http import Response
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.categories import Categories, apply_category
+from locations.hours import DAYS_FROM_SUNDAY, OpeningHours
+from locations.items import Feature
+from locations.json_blob_spider import JSONBlobSpider
+
+BRANDS = {
+    "ACF": {"brand": "Abercrombie & Fitch", "brand_wikidata": "Q319344"},
+    "KID": {"brand": "Abercrombie Kids", "brand_wikidata": "Q429856"},
+}
 
 
-class AbercrombieAndFitchSpider(scrapy.Spider):
+class AbercrombieAndFitchSpider(JSONBlobSpider):
     name = "abercrombie_and_fitch"
-    item_attributes = { 'brand': "Abercrombie and Fitch" }
     allowed_domains = ["abercrombie.com"]
-    # Website is blocking scrapers so I had to change the User Agent to get around this
-    custom_settings = {
-        'USER_AGENT': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_12_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/61.0.3163.100 Safari/537.36'
-    }
+    start_urls = ["https://www.abercrombie.com/api/ecomm/a-us/storelocator/search?country="]
+    locations_key = "physicalStores"
+    # robots.txt disallows /api/*, which is the only path serving store data.
+    custom_settings = {"ROBOTSTXT_OBEY": False}
+    requires_proxy = True
 
-    def start_requests(self):
-        countries = [
-            'US', 'CA', 'BE', 'FR', 'DE', 'HK', 'IE', 'IT', 'JP',
-            'KW', 'CN', 'MX', 'NL', 'QA', 'SA', 'SG', 'ES', 'AE', 'GB'
-        ]
+    def pre_process_data(self, location: dict) -> None:
+        location["street_address"] = location.pop("addressLine")[0]
+        if (state := location.pop("stateOrProvinceName")) != location["country"]:
+            location["state"] = state
+        if location.get("postalCode") == "-":
+            location.pop("postalCode")
 
-        template = 'https://www.abercrombie.com/api/ecomm/a-ca/storelocator/search?country={country}'
+    def post_process_item(self, item: Feature, response: Response, location: dict) -> Iterable[Feature]:
+        attributes = {
+            attribute["name"]: attribute["value"]
+            for attribute in location["physicalStoreAttribute"]
+            if attribute["Displayable"]
+        }
+        # Inventory-only records expose no displayable attributes, brand included.
+        if not (brand := BRANDS.get(attributes.get("Brand"))):
+            return
+        item.update(brand)
+        item["branch"] = item.pop("name")
 
-        for country in countries:
-            url = template.format(country=country)
-            yield scrapy.Request(url, callback=self.parse)
+        if hours := attributes.get("hours-Week1"):
+            item["opening_hours"] = OpeningHours()
+            for day, times in zip(DAYS_FROM_SUNDAY, hours.split(",")):
+                open_time, _, close_time = times.partition("|")
+                if open_time == close_time:
+                    item["opening_hours"].set_closed(day)
+                else:
+                    item["opening_hours"].add_range(day, open_time, close_time)
 
-    def parse(self, response):
-        data = json.loads(response.body_as_unicode())
-
-        for row in data["physicalStores"]:
-            for brand in row["physicalStoreAttribute"]:
-                if brand["name"] == 'Brand':
-                    brandValue = brand["value"]
-            properties = {
-                'ref': row["storeNumber"],
-                'name': row["name"],
-                'country': row["country"],
-                'state': row["stateOrProvinceName"],
-                'city': row["city"],
-                'lat': row["latitude"],
-                'lon': row["longitude"],
-                'phone': row["telephone"],
-                'addr_full': row["addressLine"][0],
-                'postcode': row["postalCode"],
-                'brand': brandValue
-            }
-
-            yield GeojsonPointItem(**properties)
+        apply_category(Categories.SHOP_CLOTHES, item)
+        yield item

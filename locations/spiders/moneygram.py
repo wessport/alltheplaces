@@ -1,76 +1,249 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from typing import Any, AsyncIterator
+
 import scrapy
-from locations.items import GeojsonPointItem
+from scrapy.http import JsonRequest, Response
+
+from locations.dict_parser import DictParser
 from locations.hours import OpeningHours
 
 
-class MichaelsSpider(scrapy.Spider):
-    download_delay = 0.2
+class MoneygramSpider(scrapy.Spider):
     name = "moneygram"
-    item_attributes = { 'brand': "Moneygram", 'brand_wikidata': "Q1944412" }
-    allowed_domains = ["locations.moneygram.com"]
-    start_urls = (
-        'http://locations.moneygram.com/',
-    )
+    item_attributes = {"brand": "MoneyGram", "brand_wikidata": "Q1944412"}
 
-    def parse(self, response):
-        urls = response.xpath('//div[@class="statelist_item"]/a/@href').extract()
+    async def start(self) -> AsyncIterator[Any]:
+        for country in [
+            "AE",
+            "AF",
+            "AG",
+            "AI",
+            "AL",
+            "AM",
+            "AO",
+            "AR",
+            "AT",
+            "AU",
+            "AW",
+            "BA",
+            "BB",
+            "BD",
+            "BE",
+            "BF",
+            "BG",
+            "BH",
+            "BI",
+            "BJ",
+            "BL",
+            "BM",
+            "BN",
+            "BO",
+            "BR",
+            "BS",
+            "BT",
+            "BW",
+            "BY",
+            "BZ",
+            "CA",
+            "CD",
+            "CF",
+            "CG",
+            "CH",
+            "CI",
+            "CL",
+            "CM",
+            "CN",
+            "CO",
+            "CR",
+            "CV",
+            "CW",
+            "CY",
+            "CZ",
+            "DE",
+            "DJ",
+            "DK",
+            "DM",
+            "DO",
+            "EC",
+            "EE",
+            "EG",
+            "ES",
+            "ET",
+            "FJ",
+            "FM",
+            "FR",
+            "GA",
+            "GB",
+            "GD",
+            "GE",
+            "GF",
+            "GH",
+            "GI",
+            "GM",
+            "GN",
+            "GP",
+            "GQ",
+            "GR",
+            "GT",
+            "GW",
+            "GY",
+            "HK",
+            "HN",
+            "HR",
+            "HT",
+            "HU",
+            "ID",
+            "IE",
+            "IL",
+            "IN",
+            "IQ",
+            "IT",
+            "JM",
+            "JO",
+            "JP",
+            "KE",
+            "KG",
+            "KH",
+            "KM",
+            "KN",
+            "KR",
+            "KW",
+            "KY",
+            "KZ",
+            "LA",
+            "LB",
+            "LC",
+            "LK",
+            "LR",
+            "LS",
+            "LT",
+            "LU",
+            "LV",
+            "LY",
+            "MA",
+            "MD",
+            "ME",
+            "MF",
+            "MG",
+            "MH",
+            "MK",
+            "ML",
+            "MM",
+            "MN",
+            "MQ",
+            "MR",
+            "MS",
+            "MT",
+            "MU",
+            "MV",
+            "MW",
+            "MX",
+            "MY",
+            "MZ",
+            "NA",
+            "NE",
+            "NG",
+            "NI",
+            "NL",
+            "NO",
+            "NP",
+            "NZ",
+            "OM",
+            "PA",
+            "PE",
+            "PG",
+            "PH",
+            "PK",
+            "PL",
+            "PR",
+            "PS",
+            "PT",
+            "PY",
+            "QA",
+            "RE",
+            "RO",
+            "RS",
+            "RW",
+            "SA",
+            "SB",
+            "SC",
+            "SD",
+            "SE",
+            "SG",
+            "SL",
+            "SM",
+            "SN",
+            "SR",
+            "SS",
+            "ST",
+            "SV",
+            "SX",
+            "SZ",
+            "TC",
+            "TD",
+            "TG",
+            "TH",
+            "TJ",
+            "TL",
+            "TN",
+            "TO",
+            "TR",
+            "TT",
+            "TV",
+            "TZ",
+            "UA",
+            "UG",
+            "US",
+            "UY",
+            "UZ",
+            "VC",
+            "VE",
+            "VG",
+            "VI",
+            "VN",
+            "VU",
+            "WS",
+            "XK",
+            "YE",
+            "YT",
+            "ZA",
+            "ZM",
+            "ZW",
+        ]:
+            yield JsonRequest(
+                url=f"https://www.moneygram.com/locations/api/locations/states?country={country}",
+                cb_kwargs={"country": country},
+            )
 
-        for url in urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_state)
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for state in response.json()["states"]:
+            yield JsonRequest(
+                url=f'https://www.moneygram.com/locations/api/locations/cities?country={kwargs["country"]}&state={state["code"]}',
+                callback=self.parse_cities,
+                cb_kwargs={"country": kwargs["country"]},
+            )
 
-    def parse_state(self, response):
-        location_urls = response.xpath('//div[@class="citylist_item"]/a/@href').extract()
+    def parse_cities(self, response, **kwargs):
+        for city in response.json()["cities"]:
+            yield JsonRequest(
+                url=f'https://www.moneygram.com/locations/api/locations?address={city["city"]}&country={kwargs["country"]}',
+                callback=self.parse_details,
+                cb_kwargs={"country": kwargs["country"]},
+            )
 
-        for url in location_urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_city)
+    def parse_details(self, response, **kwargs):
+        for location in response.json().get("locations"):
+            location.update(location.pop("locationDetails"))
+            item = DictParser.parse(location)
+            item["branch"] = item.pop("name")
+            item["ref"] = " - ".join([item["ref"], kwargs["country"]])
+            try:
+                oh = OpeningHours()
+                for key, value in location.get("locationOperatingHours").items():
+                    day = key.replace("Hours", "")
+                    open_time, close_time = value.split(" - ")
+                    oh.add_range(day=day, open_time=open_time, close_time=close_time, time_format="%I:%M %p")
+                item["opening_hours"] = oh
+            except:
+                pass
 
-    def parse_city(self, response):
-        city_urls = response.xpath('//div[@class="addresslist_item"]/a/@href').extract()
-
-        for url in city_urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_location)
-
-    def parse_location(self, response):
-        data = json.loads(response.xpath('//script[@type="application/ld+json"][2]/text()').extract_first())
-
-        properties = {
-            'ref': data.get('@id'),
-            'addr_full': data.get('address', {}).get('streetAddress'),
-            'city': data.get('address', {}).get('addressLocality'),
-            'state': data.get('address', {}).get('addressRegion'),
-            'postcode': data.get('address', {}).get('postalCode'),
-            'postcode': data.get('name'),
-            'phone': data.get('telephone'),
-            'country': data.get('address', {}).get('addressCountry'),
-            'lat': data.get('geo', {}).get('latitude'),
-            'lon': data.get('geo', {}).get('longitude'),
-            'website': data.get('url'),
-            'extras': {
-                'is_in': data.get('containedIn'),
-            }
-        }
-
-        hours = self.parse_hours(data.get('openingHoursSpecification'))
-
-        if hours:
-            properties['opening_hours'] = hours
-
-        yield GeojsonPointItem(**properties)
-
-    def parse_hours(self, response):
-        opening_hours = OpeningHours()
-        weekdays = response
-
-        for weekday in weekdays:
-            for dow in weekday.get('dayOfWeek', []):
-                opening_hours.add_range(
-                    dow[:2],
-                    open_time=weekday.get('opens'),
-                    close_time=weekday.get('closes'),
-                    time_format='%H:%M',
-                )
-
-        return opening_hours.as_opening_hours()
+            yield item

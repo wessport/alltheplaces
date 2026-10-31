@@ -1,37 +1,47 @@
-# -*- coding: utf-8 -*-
-import json
-import re
-
-import scrapy
-
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, apply_category
+from locations.storefinders.woosmap import WoosmapSpider
 
 
-class ELeclercSpider(scrapy.spiders.SitemapSpider):
+class ELeclercSpider(WoosmapSpider):
     name = "e_leclerc"
-    item_attributes = {'brand': 'E.Leclerc', 'brand_wikidata': 'Q1273376'}
-    allowed_domains = ["e-leclerc.com"]
-    sitemap_urls = [
-        'https://www.e-leclerc.com/sitemap_www_index.xml',
-    ]
-    sitemap_rules = [
-        (r'https:\/\/www\.e-leclerc\.com\/[^\/]+?$', 'parse_location')
-    ]
-    sitemap_follow = ['/sitemap_section_']
+    item_attributes = {"brand": "E.Leclerc", "brand_wikidata": "Q1273376"}
+    key = "woos-6256d36f-af9b-3b64-a84f-22b2342121ba"
+    origin = "https://www.e.leclerc"
 
-    def parse_location(self, response):
-        properties = {
-            'ref': re.search(r'.+/(.+?)/?(?:\.html|$)', response.url).group(1),
-            'name': response.xpath('//p[@itemprop="address"]/span[1]/text()').extract_first(),
-            'addr_full': response.xpath('normalize-space(//span[@itemprop="streetAddress"]//text())').extract_first().replace("\xa0", ' '),
-            'city': response.xpath('normalize-space(//span[@itemprop="addressLocality"]//text())').extract_first(),
-            'state': response.xpath('normalize-space(//span[@itemprop="addressRegion"]//text())').extract_first(),
-            'postcode': response.xpath('normalize-space(//span[@itemprop="postalCode"]//text())').extract_first(),
-            'country': 'FR',
-            'phone': response.xpath('normalize-space(//span[@itemprop="telephone"]//text())').extract_first(),
-            'website': response.url,
-            'lat': float(response.xpath('normalize-space(//span[@itemprop="latitude"]/text())').extract_first()),
-            'lon': float(response.xpath('normalize-space(//span[@itemprop="longitude"]/text())').extract_first()),
-        }
+    brands = {
+        "Jardi": ({"brand": "E.Leclerc Jardi"}, Categories.SHOP_GARDEN_CENTRE),
+        "Hyper": ({"brand": "E.Leclerc"}, Categories.SHOP_SUPERMARKET),
+        "Super": ({"brand": "E.Leclerc"}, Categories.SHOP_SUPERMARKET),
+        "Manège à Bijoux": ({"brand": "Manège à Bijoux"}, Categories.SHOP_JEWELRY),
+        "Drive": ({"brand": "E.Leclerc Drive"}, Categories.SHOP_OUTPOST),
+        "Une Heure Pour Soi": ({"brand": "Une Heure Pour Soi"}, Categories.SHOP_PERFUMERY),
+        "Station Service": ({"brand": "E.Leclerc"}, Categories.FUEL_STATION),
+        "Auto": ({"brand": "E.Leclerc"}, Categories.SHOP_CAR_REPAIR),
+        "E.Leclerc Express": ({"brand": "E.Leclerc Express"}, Categories.SHOP_SUPERMARKET),
+        "Voyages": ({"brand": "E.Leclerc"}, Categories.SHOP_TRAVEL_AGENCY),
+        "Espace Culturel": ({"brand": "E.Leclerc Espace Culturel"}, Categories.SHOP_ELECTRONICS),
+        "Parapharmacie": ({"brand": "E.Leclerc Parapharmacie"}, Categories.PHARMACY),
+        "Location": ({"brand": "E.Leclerc Location"}, Categories.CAR_RENTAL),
+        "Brico": ({"brand": "E.Leclerc Brico"}, Categories.SHOP_DOITYOURSELF),
+        "Click and Collect": None,
+    }
 
-        yield GeojsonPointItem(**properties)
+    def parse_item(self, item, feature, **kwargs):
+        if feature["properties"]["user_properties"]["type"] != "pdv":
+            return None
+
+        item["website"] = feature["properties"]["user_properties"].get("urlStore")
+        item["facebook"] = feature["properties"]["user_properties"].get("catchmentArea", {}).get("urlFacebook")
+
+        store_type = feature["properties"]["user_properties"]["commercialActivity"]["label"]
+        if brand := self.brands.get(store_type):
+            item.update(brand[0])
+            if len(brand) == 2:
+                apply_category(brand[1], item)
+        else:
+            self.crawler.stats.inc_value(
+                f'atp/e_leclerc/unmapped_category/{store_type}/{feature["properties"]["user_properties"]["commercialActivity"]["activityCode"]}'
+            )
+            return None
+
+        yield item

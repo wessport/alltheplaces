@@ -1,0 +1,41 @@
+from typing import Iterable
+
+import chompjs
+from scrapy import Selector
+from scrapy.http import Response
+
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.items import Feature
+from locations.json_blob_spider import JSONBlobSpider
+from locations.structured_data_spider import extract_phone
+
+
+class MitsubishiBYRUSpider(JSONBlobSpider):
+    name = "mitsubishi_by_ru"
+    item_attributes = {"brand": "Mitsubishi", "brand_wikidata": "Q36033"}
+    start_urls = ["https://www.mitsubishi-motors.ru/for-byers/dealers/"]
+    no_refs = True
+
+    def extract_json(self, response: Response) -> list[dict]:
+        return chompjs.parse_js_object(response.xpath('//script[contains(text(), "placemarks")]/text()').get())
+
+    def post_process_item(self, item: Feature, response: Response, feature: dict) -> Iterable[Feature]:
+        extract_phone(item, Selector(text=feature["phone"]))
+
+        item["website"] = "https://" + feature["www"] if not feature["www"].startswith("http") else feature["www"]
+        if "mitsubishi" not in item["website"]:  # Not a branded location
+            return
+
+        is_shop = not feature.get("no_salon")
+        is_repair = feature.get("service_partner") == "1"
+
+        if is_shop:
+            shop_item = item.deepcopy()
+            apply_category(Categories.SHOP_CAR, shop_item)
+            apply_yes_no(Extras.VEHICLE_CAR_REPAIR_SERVICES, shop_item, is_repair)
+            yield shop_item
+
+        if is_repair:
+            repair_item = item.deepcopy()
+            apply_category(Categories.SHOP_CAR_REPAIR, repair_item)
+            yield repair_item

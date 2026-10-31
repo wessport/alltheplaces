@@ -1,78 +1,67 @@
-# -*- coding: utf-8 -*-
-import scrapy
 import re
-import json
-from locations.items import GeojsonPointItem
+
+import scrapy
+
+from locations.categories import Extras, apply_yes_no
+from locations.hours import OpeningHours, sanitise_day
+from locations.items import Feature
+from locations.spiders.mcdonalds import McdonaldsSpider
+
+FACILITIES_MAPPING = {"Drive Thru": Extras.DRIVE_THROUGH, "McDelivery": Extras.DELIVERY, "WiFi": Extras.WIFI}
 
 
-class McDonaldsEGSpider(scrapy.Spider):
-
+class McdonaldsEGSpider(scrapy.Spider):
     name = "mcdonalds_eg"
-    item_attributes = { 'brand': "McDonald's" }
-    allowed_domains = ["www.mcdonalds.eg"]
-    start_urls = (
-        'http://www.mcdonalds.eg/ar/stores/page/228',
-    )
+    item_attributes = McdonaldsSpider.item_attributes
+    allowed_domains = ["mcdonalds.eg"]
+    start_urls = ["https://mcdonalds.eg/Stotes"]
 
-    def normalize_time(self, time_str, flag=False):
-        match = re.search(r'([0-9]{1,2}):([0-9]{1,2})', time_str)
-        h, m = match.groups()
-
-        return '%02d:%02d' % (
-            int(h) + 12 if flag and int(h) < 13 else int(h),
-            int(m),
-        )
-
-    def store_hours(self, response):
-        response = '<div id="mapInfo" style="width: 200px;">' + response
-        selector = scrapy.Selector(text=response)
-        opening_hours = selector.xpath('//*[@id="mapInfo"]/div/span[4]/text()').extract_first()
-        if not opening_hours:
-            return None
-        opening_hours = opening_hours.strip()
-        match = re.search(r' ([0-9]{1,2}:[0-9]{1,2}).*([0-9]{1,2}:[0-9]{1,2})', opening_hours)
-        if not match:
-            return None
-        start, end = match.groups()
-        start = self.normalize_time(start)
-        end = self.normalize_time(end, True)
-
-        return 'Mo-Fr {}-{}'.format(start, end)
-
-    def parse_data(self, response):
-        response = '<div id="mapInfo" style="width: 200px;">' + response
-        selector = scrapy.Selector(text=response)
-        name = selector.xpath('//h2[@class="store-title"]/b/text()').extract_first().strip()
-        address = selector.xpath('//*[@id="mapInfo"]/div/span[1]/text()').extract_first().strip()
-        phone = selector.xpath('//span[@class="store-tel"]/text()').extract_first()
-        phone = phone.strip() if phone else ''
-        return name, address, phone
+    @staticmethod
+    def parse_hours(rules: list) -> OpeningHours:
+        oh = OpeningHours()
+        for day, start_time, end_time in rules:
+            day = sanitise_day(day)
+            if not day:
+                continue
+            if start_time == "9999" or end_time == "9999":
+                continue
+            if end_time == "2400":
+                end_time = "2359"
+            if start_time and end_time:
+                try:
+                    oh.add_range(day, start_time, end_time, time_format="%H%M")
+                except:
+                    pass
+        return oh
 
     def parse(self, response):
-        match = re.search(r'var locS = (\[.*\])\;', response.body_as_unicode())
-        results = json.loads(match.groups()[0])
-        index = 0
-        for data in results:
-            data = data.replace("''", '""')
-            try:
-                store = json.loads(data)
-            except Exception as e:
-                continue
+        for data in response.json():
+            item = Feature(
+                {
+                    "city": data["store_suburb"],
+                    "ref": data["store_code"],
+                    "street_address": data["store_address"],
+                    "phone": data.get("store_phone"),
+                    "state": data["store_state"],
+                    "postcode": data.get("store_postcode"),
+                }
+            )
 
-            name, address, phone = self.parse_data(store[0])
-            
-            properties = {
-                'ref': index,
-                'addr_full': address,
-                'phone': phone,
-                'name': name,
-                'lat': store[1],
-                'lon': store[2],
-            }
+            if coordinates := data.get("lat_long"):
+                item["lat"] = coordinates.get("lat")
+                item["lon"] = coordinates.get("lon")
+            if (not item.get("lat") or not item.get("lon")) and data.get("store_geocode"):
+                if m := re.search(r"(?P<lon>-?\d+(?:\.\d+))\s*,\s*(?P<lat>-?\d+(?:\.\d+))", data["store_geocode"]):
+                    item["lat"] = m.group("lat")
+                    item["lon"] = m.group("lon")
 
-            opening_hours = self.store_hours(store[0])
-            if opening_hours:
-                properties['opening_hours'] = opening_hours
-            index = index + 1
-            yield GeojsonPointItem(**properties)
+            item["opening_hours"] = self.parse_hours(data.get("store_trading_hour", []))
 
+            facilities = [f.get("name") for f in data.get("store_filter", []) if f]
+            for facility in facilities:
+                if match := FACILITIES_MAPPING.get(facility):
+                    apply_yes_no(match, item, True)
+                else:
+                    self.crawler.stats.inc_value(f"atp/{self.name}/facilities/fail/{facility}")
+
+            yield item

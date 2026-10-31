@@ -1,86 +1,85 @@
-# -*- coding: utf-8 -*-
-import json
-import scrapy
-from scrapy.linkextractors import LinkExtractor
+import re
+from copy import deepcopy
+from typing import Any, Iterable
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from scrapy.http import TextResponse
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Categories, apply_category
+from locations.hours import DAYS, OpeningHours
+from locations.items import Feature
+from locations.json_blob_spider import JSONBlobSpider
+from locations.spiders.toyota_au import TOYOTA_SHARED_ATTRIBUTES
 
 
-class ToyotaUSSpider(scrapy.Spider):
+class ToyotaUSSpider(SitemapSpider, JSONBlobSpider):
     name = "toyota_us"
-    item_attributes = {
-        "brand": "Toyota",
-        "brand_wikidata": "Q53268",
-    }
-    allowed_domains = ["www.toyota.com"]
-    start_urls = ["https://www.toyota.com/dealers/directory/"]
+    item_attributes = TOYOTA_SHARED_ATTRIBUTES
+    sitemap_urls = ["https://www.toyota.com/sitemap-dealers.xml"]
+    locations_key = "dealers"
+    zipcode_match = re.compile(r"/dealers/[-\w]+/[-\w]+/(\d+)/[-\w]+/?$")
+    custom_settings = {"ROBOTSTXT_OBEY": False, "DEFAULT_REQUEST_HEADERS": {"origin": "https://www.toyota.com"}}
 
-    link_extractor = LinkExtractor(restrict_css=".dealership-state")
+    def sitemap_filter(self, entries: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+        for entry in entries:
+            if match := re.search(self.zipcode_match, entry["loc"]):
+                """
+                Dealer location sitemap URLs do not provide coordinates, so the API is used instead.
+                The resultsMax=10 parameter ensures that multiple dealer locations sharing the same ZIP code are retrieved.
+                """
+                yield {
+                    "loc": f"https://dealers.prod.webservices.toyota.com/v1/dealers?resultsMax=10&zipcode={match.group(1)}",
+                }
 
-    def parse(self, response):
-        for link in self.link_extractor.extract_links(response):
-            yield scrapy.Request(link.url)
+    def pre_process_data(self, feature: dict) -> None:
+        feature.pop("region", None)
 
-        for dealer_ref in response.xpath("//a/@data-code").getall():
-            yield scrapy.Request(
-                f"https://www.toyota.com/ToyotaSite/rest/dealerRefresh/locateDealers?&dealerCode={dealer_ref}",
-                callback=self.parse_dealer,
-            )
+    def post_process_item(self, item: Feature, response: TextResponse, feature: dict) -> Iterable[Feature]:
+        item["ref"] = feature["dealerId"]
 
-    def parse_dealer(self, response):
-        j = json.loads(response.text)
-        info = j["showDealerLocatorDataArea"]["dealerLocator"][0][
-            "dealerLocatorDetail"
-        ][0]
-        contact = info["dealerParty"]["specifiedOrganization"]["primaryContact"][0]
-        lat = info["proximityMeasureGroup"]["geographicalCoordinate"][
-            "latitudeMeasure"
-        ]["value"]
-        lon = info["proximityMeasureGroup"]["geographicalCoordinate"][
-            "longitudeMeasure"
-        ]["value"]
-        ref = info["dealerParty"]["partyID"]["value"]
-        name = info["dealerParty"]["specifiedOrganization"]["companyName"]["value"]
+        # All locations appear to offer both sales and service.
+        yield self.build_shop(item, feature)
+        yield self.build_service(item, feature)
 
-        addr_full = contact["postalAddress"]["lineOne"]["value"]
-        city = contact["postalAddress"]["cityName"]["value"]
-        country = contact["postalAddress"]["countryID"]
-        postcode = contact["postalAddress"]["postcode"]["value"]
-        state = contact["postalAddress"]["stateOrProvinceCountrySubDivisionID"]["value"]
+        if feature.get("hoursParts"):
+            yield self.build_parts(item, feature)
 
-        phone = contact["telephoneCommunication"][0]["completeNumber"]["value"]
-        website = contact["uricommunication"][0]["uriid"]["value"]
-        opening_hours = (
-            self.parse_hours(info["hoursOfOperation"][0]["daysOfWeek"])
-            if "hoursOfOperation" in info
-            else None
-        )
+    def build_shop(self, item: Feature, feature: dict) -> Feature:
+        shop_item = deepcopy(item)
+        shop_item["ref"] = f"{item['ref']}-SHOP"
+        shop_item["opening_hours"] = self.parse_opening_hours(feature, "sales")
+        apply_category(Categories.SHOP_CAR, shop_item)
+        return shop_item
 
-        return GeojsonPointItem(
-            ref=ref,
-            lat=lat,
-            lon=lon,
-            name=name,
-            country=country,
-            state=state,
-            city=city,
-            addr_full=addr_full,
-            postcode=postcode,
-            phone=phone,
-            website=website,
-            opening_hours=opening_hours,
-        )
+    def build_service(self, item: Feature, feature: dict) -> Feature:
+        service_item = deepcopy(item)
+        service_item["ref"] = f"{item['ref']}-SERVICE"
+        service_item["phone"] = feature.get("phoneNumberService")
+        service_item["opening_hours"] = self.parse_opening_hours(feature, "service")
+        apply_category(Categories.SHOP_CAR_REPAIR, service_item)
+        return service_item
 
-    def parse_hours(self, days_of_week_obj):
+    def build_parts(self, item: Feature, feature: dict) -> Feature:
+        parts_item = deepcopy(item)
+        parts_item["ref"] = f"{item['ref']}-PARTS"
+        parts_item["phone"] = feature.get("phoneNumberParts")
+        parts_item["opening_hours"] = self.parse_opening_hours(feature, "parts")
+        apply_category(Categories.SHOP_CAR_PARTS, parts_item)
+        return parts_item
+
+    def parse_opening_hours(self, feature: dict, location_type: str) -> OpeningHours:
+        if location_type == "sales":
+            hours_list = feature.get("sales", {}).get("hours", []) or feature.get("general", {}).get("hours", [])
+        else:
+            hours_list = feature.get(location_type, {}).get("hours", [])
+
         opening_hours = OpeningHours()
-        for x in days_of_week_obj:
-            if "availabilityStartTimeMeasure" not in x:
+        for index, rule in enumerate(hours_list):
+            day = DAYS[index - 1]
+            if "Closed" in rule:
+                opening_hours.set_closed(day)
                 continue
-            day = x["dayOfWeekCode"][:2]
-            open_hr, open_min = divmod(x["availabilityStartTimeMeasure"]["value"], 60)
-            close_hr, close_min = divmod(x["availabilityEndTimeMeasure"]["value"], 60)
-            opening_hours.add_range(
-                day, f"{open_hr}:{open_min:02}", f"{close_hr}:{close_min:02}"
-            )
-        return opening_hours.as_opening_hours()
+            for shift in rule:
+                open_time, close_time = shift.split(",")
+                opening_hours.add_range(day, open_time.strip(), close_time.strip(), "%H%M")
+        return opening_hours

@@ -1,81 +1,62 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-import re
-from locations.items import GeojsonPointItem
+from typing import Any, AsyncIterator
 
-class McDonaldsTRSpider(scrapy.Spider):
-    name = 'mcdonalds_tr'
-    item_attributes = { 'brand': "McDonald's" }
-    allowed_domains = ['www.mcdonalds.com.tr']
-        
-    def start_requests(self):
-        url = 'https://www.mcdonalds.com.tr/Content/WebService/ClientSiteWebService.asmx/GetRestaurantsV5'
-        # for state in STATES:
-        formdata = {
-            "cityId": "0",
-            "townId": "0",
-            "Services": ""
-        }
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
 
-        headers = {
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Content-Type': 'application/json',
-            'Origin': 'https://www.mcdonalds.com.tr',
-            'Host':'www.mcdonalds.com.tr',
-            'Referer': 'https://www.mcdonalds.com.tr/kurumsal/restoranlar',
-            'X-Requested-With': 'XMLHttpRequest'
-        }
-        
-        yield scrapy.http.Request(
-            url, 
-            self.parse,
-            method = 'POST',
-            body = json.dumps(formdata),
-            headers = headers,
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS, OpeningHours
+from locations.spiders.mcdonalds import McdonaldsSpider
+
+
+class McdonaldsTRSpider(Spider):
+    name = "mcdonalds_tr"
+    item_attributes = McdonaldsSpider.item_attributes
+    allowed_domains = ["www.mcdonalds.com.tr"]
+    start_urls = ["https://www.mcdonalds.com.tr/restaurants/getstores"]
+    # A significant proportion of requests are either blocked (possibly
+    # by the Turkish government) or the website is very unreliable.
+    # Minimise requests and retry a few extra times.
+    custom_settings = {"ROBOTSTXT_OBEY": False, "RETRY_TIMES": 10}
+
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        yield JsonRequest(
+            url="https://www.mcdonalds.com.tr/restaurants/getstores",
+            data={
+                "cityId": "0",
+                "subcity": "",
+                "avm": "false",
+                "birthday": "false",
+                "isDeliveryStore": "false",
+                "open724": "false",
+                "breakfast": "false",
+                "mcdcafe": "false",
+            },
         )
 
-    def normalize_time(self, time_str):
-        match = re.search(r'([0-9]{1,2}):([0-9]{1,2})', time_str)
-        h, m = match.groups()
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for location in response.json()["data"]:
+            item = DictParser.parse(location)
+            item["branch"] = item.pop("name")
+            item["addr_full"] = location["STORE_ADDRESS"]
+            item["opening_hours"] = OpeningHours()
+            if location["TWENTYFOUR_HRS"]:
+                item["opening_hours"].add_days_range(DAYS, "00:00", "24:00")
+            else:
+                open_time = (
+                    str(location["STORE_OPEN_AT"]["Hours"]).zfill(2)
+                    + ":"
+                    + str(location["STORE_OPEN_AT"]["Minutes"]).zfill(2)
+                )
+                close_time = (
+                    str(location["STORE_CLOSE_AT"]["Hours"]).zfill(2)
+                    + ":"
+                    + str(location["STORE_CLOSE_AT"]["Minutes"]).zfill(2)
+                )
+                item["opening_hours"].add_days_range(DAYS, open_time, close_time)
+            apply_yes_no(Extras.DRIVE_THROUGH, item, location["MC_DRIVE"], False)
+            apply_yes_no(Extras.DELIVERY, item, location["IS_DELIVERY_STORE"], False)
 
-        return '%02d:%02d' % (
-            int(h) + 12 if int(h)<13 else int(h),
-            int(m),
-        )
+            apply_category(Categories.FAST_FOOD, item)
 
-    def store_hours(self, hour):
-        data = hour[0]
-        if not data['Name']:
-            return '24/7'
-        value = data['Value'].strip()
-        if value == "-":
-            return None
-
-        start = value.split("-")[0].strip()
-        end = value.split("-")[1].strip()
-        end = self.normalize_time(end)
-        return 'Mo-Su ' + start + ':' + end
-
-    def parse(self, response):
-        results = json.loads(response.body_as_unicode())
-        results = results['d']
-        for data in results:
-            properties = {
-                'city': data['City'],
-                'ref': data['ID'],
-                'phone': data['Phone'].strip(),
-                'lon': data['Longitude'],
-                'lat': data['Latitude'],
-                'name': data['Name'],
-                'addr_full': data['Address'],
-                'state': data['Town']
-            }
-
-            opening_hours = self.store_hours(data['WorkingHours'])
-            if opening_hours:
-                properties['opening_hours'] = opening_hours
-
-            yield GeojsonPointItem(**properties)
+            yield item

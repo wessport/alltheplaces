@@ -1,47 +1,34 @@
-# -*- coding: utf-8 -*-
 import json
 import re
+from typing import Any
 
-import scrapy
+from scrapy.http import Response
+from scrapy.spiders import Spider
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.dict_parser import DictParser
+from locations.user_agents import BROWSER_DEFAULT
 
 
-class ExtendedStayAmericaSpider(scrapy.Spider):
+class ExtendedStayAmericaSpider(Spider):
     name = "extended_stay_america"
-    item_attributes = {'brand': 'Extended Stay America'}
-    allowed_domains = ["extendedstayamerica.com"]
-    start_urls = [
-        'https://www.extendedstayamerica.com/hotels',
-    ]
+    item_attributes = {
+        "brand": "Extended Stay America",
+        "brand_wikidata": "Q5421850",
+        "country": "US",
+    }
+    start_urls = ["https://www.extendedstayamerica.com/hotels"]
+    custom_settings = {"AUTOTHROTTLE_ENABLED": True, "USER_AGENT": BROWSER_DEFAULT}
+    requires_proxy = True
 
-    def parse(self, response):
-        urls = response.xpath('//tr/td/a/@href').extract()
-        for url in urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_state)
-
-    def parse_state(self, response):
-        urls = response.xpath('//div[@class="links"]//td/a/@href').extract()
-        for url in urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_hotel_list)
-
-    def parse_hotel_list(self, response):
-        script = response.xpath('//script[contains(text(), "pinList")]/text()').extract_first()
-        hotels = json.loads(re.search(r'var pinList =\s(\{.*\});', script).groups()[0])
-
-        for hotel in hotels["PushPins"]:
-            properties = {
-                'name': hotel["HotelName"],
-                'ref': hotel["HotelId"],
-                'addr_full': hotel["Address"],
-                'city': hotel["HotelCity"],
-                'state': hotel["HotelState"],
-                'postcode': hotel["HotelZip"],
-                'country': 'US',
-                'website': hotel["MinisiteUrl"],
-                'lat': float(hotel["Latitude"]),
-                'lon': float(hotel["Longitude"]),
-            }
-
-            yield GeojsonPointItem(**properties)
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        raw_data = json.loads(re.search(r"hotelsData\s*=\s*(\[.*\]);", response.text).group(1))
+        for location in raw_data:
+            item = DictParser.parse(location)
+            item["branch"] = item.pop("name")
+            item["ref"] = location["siteId"]
+            item["website"] = response.urljoin(location["urlMap"])
+            # DictParser maps "street" -> addr:street (street name only), but the source
+            # field contains the full address line including house number, so use street_address.
+            if street := item.pop("street", None):
+                item["street_address"] = street
+            yield item

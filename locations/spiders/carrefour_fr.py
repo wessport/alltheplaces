@@ -1,42 +1,100 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.storefinders.woosmap import WoosmapSpider
 
-import scrapy
+CARREFOUR_SUPERMARKET = {
+    "brand": "Carrefour",
+    "brand_wikidata": "Q217599",
+    "category": Categories.SHOP_SUPERMARKET,
+}
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+CARREFOUR_CONVENIENCE = {
+    "brand": "Carrefour",
+    "brand_wikidata": "Q217599",
+    "category": Categories.SHOP_CONVENIENCE,
+}
+
+CARREFOUR_MARKET = {
+    "brand": "Carrefour Market",
+    "brand_wikidata": "Q2689639",
+    "category": Categories.SHOP_SUPERMARKET,
+}
+CARREFOUR_CONTACT = {
+    "brand": "Carrefour Contact",
+    "brand_wikidata": "Q2940188",
+    "category": Categories.SHOP_SUPERMARKET,
+}
+CARREFOUR_EXPRESS = {
+    "brand": "Carrefour Express",
+    "brand_wikidata": "Q2940190",
+    "category": Categories.SHOP_CONVENIENCE,
+}
+CARREFOUR_CITY = {
+    "brand": "Carrefour City",
+    "brand_wikidata": "Q2940187",
+    "category": Categories.SHOP_SUPERMARKET,
+}
 
 
-class CarrefourFrSpider(scrapy.Spider):
+class CarrefourFRSpider(WoosmapSpider):
     name = "carrefour_fr"
-    item_attributes = {'brand': "Carrefour"}
-    allowed_domains = ["carrefour.com"]
+    item_attributes = {"brand": "Carrefour", "brand_wikidata": "Q217599"}
 
-    def start_requests(self):
-        urls = ['https://www.carrefour.fr/magasin/liste', "https://www.carrefour.fr/magasin/liste/market",
-                "https://www.carrefour.fr/magasin/liste/city", "https://www.carrefour.fr/magasin/liste/bio",
-                "https://www.carrefour.fr/magasin/liste/contact", "https://www.carrefour.fr/magasin/liste/montagne",
-                "https://www.carrefour.fr/magasin/liste/bon-app"]
+    key = "woos-26fe76aa-ff24-3255-b25b-e1bde7b7a683"
+    origin = "https://www.carrefour.fr"
 
-        for url in urls:
-            yield scrapy.Request(url, callback=self.parse)
+    brands = {
+        "MARKET": CARREFOUR_MARKET,
+        "CARREFOUR": CARREFOUR_CONVENIENCE,
+        "CARREFOUR CITY": CARREFOUR_CITY,
+        "CARREFOUR CONTACT": CARREFOUR_CONTACT,
+        "CARREFOUR EXPRESS": CARREFOUR_EXPRESS,
+        "CARREFOUR MARKET": CARREFOUR_MARKET,
+        "CARREFOUR MONTAGNE": {
+            "brand": "Carrefour Montagne",
+            "brand_wikidata": "Q2940193",
+            "category": Categories.SHOP_CONVENIENCE,
+        },
+        "BON APP": {
+            "brand": "Bon App!",
+            "brand_wikidata": "Q90153100",
+            "category": Categories.SHOP_CONVENIENCE,
+        },
+        "POTAGER CITY": {
+            "brand": "Potager City",
+            "brand_wikidata": "Q60964464",
+            "category": Categories.SHOP_CONVENIENCE,
+        },
+    }
 
-    def parse(self, response):
-        data = json.loads(response.xpath(
-            '//script[@type="application/ld+json" and contains(text(), "streetAddress")]/text()').extract_first())
+    def parse_item(self, item, feature, **kwargs):
+        store_types = feature.get("properties").get("types", [])
+        if store_types:
+            parse_brand_and_category_from_mapping(item, store_types[0], self.brands)
+            item["extras"]["store_type"] = store_types[0]
+        # Unfortunately the "types" is often missing
+        elif "Parapharmacie" in item["name"]:
+            apply_category(Categories.PHARMACY, item)
+        elif "Station Service Carrefour" in item["name"]:
+            apply_category(Categories.FUEL_STATION, item)
+        else:
+            for brand in self.brands.values():
+                if brand["brand"] in item["name"]:
+                    item["brand"] = brand.get("brand")
+                    item["brand_wikidata"] = brand.get("brand_wikidata")
+                    apply_category(brand.get("category"), item)
+                    break
+            else:
+                # default to supermarket
+                apply_category(Categories.SHOP_SUPERMARKET, item)
 
-        for store in data:
-            properties = {
-                'ref': store["@id"],
-                'name': store["name"],
-                'addr_full': store["address"]["streetAddress"],
-                'city': store["address"]["addressLocality"],
-                'state': store["address"]["addressRegion"],
-                'postcode': store["address"]["postalCode"],
-                'country': store["address"]["addressCountry"],
-                'lat': store["geo"]["latitude"],
-                'lon': store["geo"]["longitude"]
-            }
+        yield item
 
-            yield GeojsonPointItem(**properties)
+
+def parse_brand_and_category_from_mapping(item: Feature, brand_key: str, brand_mapping: dict):
+    if match := brand_mapping.get(brand_key):
+        item["brand"] = match.get("brand")
+        item["brand_wikidata"] = match.get("brand_wikidata")
+        apply_category(match.get("category"), item)
+        return True
+    return False

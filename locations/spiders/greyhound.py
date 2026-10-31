@@ -1,81 +1,56 @@
-# -*- coding: utf-8 -*-
 import json
 import re
-from urllib.parse import urlencode
+from urllib.parse import urljoin
 
-import scrapy
+from scrapy.spiders import SitemapSpider
 
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, apply_category
+from locations.items import Feature
 
 
-class GreyhoundSpider(scrapy.Spider):
+class GreyhoundSpider(SitemapSpider):
     name = "greyhound"
-    item_attributes = {'brand': 'Greyhound'}
-    allowed_domains = ['locations.greyhound.com']
-    start_urls = [
-        'https://locations.greyhound.com/',
+    item_attributes = {"brand": "Greyhound", "brand_wikidata": "Q755309", "nsi_id": "N/A"}
+    allowed_domains = ["greyhound.com"]
+    sitemap_urls = ["https://www.greyhound.com/robots.txt"]
+    sitemap_rules = [
+        # City page, may contain multiple stations
+        # e.g. https://www.greyhound.com/bus/new-york-ny
+        (r"^https://www\.greyhound\.com/bus/[-\w]+$", "parse")
+        # No need to download station page. City page has all needed info
+        # e.g. https://www.greyhound.com/bus/new-york-ny/new-york-city-chinatown-bowery-canal-st
     ]
-    download_delay = 0.3
 
-    def start_requests(self):
-        url = 'https://locations.greyhound.com/getCitiesJson?'
-
-        yield scrapy.http.Request(url, self.parse, method='GET')
+    def get_stations(self, response):
+        # The richest data is JSON in an inline script call to handleStopsLocation()
+        for script in response.css("script"):
+            script = script.get()
+            m = re.search(r"handleStopsLocation\((.*\]),.*?\);\n", script)
+            if m:
+                stations = m.group(1)
+                return json.loads(stations)
+        # Page probably says "This destination is currently unavailable."
+        return []
 
     def parse(self, response):
-        search_url = 'https://locations.greyhound.com/bus-stations/search?'
+        stations = self.get_stations(response)
+        for station in stations:
+            item = Feature()
+            item["lat"] = station["Lat"]
+            item["lon"] = station["Lon"]
+            item["ref"] = station["Key"]
+            item["branch"] = station["Name"]
+            item["street_address"] = station["Address"]
+            city_state = station["AddressCity"].split(", ")
+            try:
+                item["city"] = city_state[0]
+                item["state"] = city_state[1]
+            except:
+                pass
+            item["postcode"] = station["Zip"]
+            # Phone number is brand-wide
+            # item["phone"] = station["Phone"]
+            item["website"] = urljoin(response.url, station["PagePath"])
 
-        locations = json.loads(response.body_as_unicode())
-        for location in locations.values():
-            city, state = location.split(', ')
-            params = {
-                    'city': '{}'.format(city),
-                    'state': '{}'.format(state),
-                }
-
-            yield scrapy.http.Request(search_url + urlencode(params), callback=self.parse_location_list)
-
-    def parse_location_list(self, response):
-        location_urls = response.xpath('//div[@class="col-md-6 col-xs-8 station_city_info"]/a/@href').extract()
-        for location_url in location_urls:
-            yield scrapy.http.Request(response.urljoin(location_url), callback=self.parse_location)
-
-    def parse_location(self, response):
-        ref = re.search(r'.+/(.+?)/?(?:\.html|$)', response.url).group(1)
-        name = response.xpath('//span[@class="station-title"]/text()').extract_first()
-        location_type = response.xpath(
-            'normalize-space(//*/text()[normalize-space(.)="Location Type:"]/following::text())').extract_first()
-        address = response.xpath(
-                'normalize-space(//*/text()[normalize-space(.)="Address:"]/following::text())').extract_first()
-        city_state_zip = response.xpath(
-                'normalize-space(//*/text()[normalize-space(.)="City, State Zip:"]/following::text())').extract_first()
-        match = re.search(r'([\w\s]+),\s(\w+)\s(\w+)', city_state_zip)
-        city, state, postcode = match.groups()
-        country = re.search(r".+/(.+?)/(.+?)/(.+?)/(.+?)/?(?:\.html|$)", response.url).groups()[0]
-        phone = response.xpath(
-            'normalize-space(//*/text()[normalize-space(.)="Main:"]/following::text())').extract_first()
-
-        # Get coordinates
-        map_data = response.xpath(
-            '//script[@type="text/javascript"][contains(text(), "new L.LatLng")]/text()').extract_first()
-        coordinates = re.search(r'new L.Marker\(new L.LatLng\((.*)\)\);', map_data).groups()[0]
-        lat, lon = coordinates.split(', ')
-
-        properties = {
-            'ref': ref,
-            'name': name,
-            'addr_full': address,
-            'city': city,
-            'state': state,
-            'postcode': postcode,
-            'country': country,
-            'lat': lat,
-            'lon': lon,
-            'phone': phone,
-            'website': response.url,
-            'extras': {
-                'location_type': location_type
-            }
-        }
-
-        yield GeojsonPointItem(**properties)
+            apply_category(Categories.BUS_STATION, item)
+            yield item

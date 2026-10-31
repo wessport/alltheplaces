@@ -1,38 +1,47 @@
-# -*- coding: utf-8 -*-
-import json
 import re
+from typing import Any, Iterable
 
-import scrapy
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.items import Feature
 
 
-class GodfathersPizzaSpider(scrapy.Spider):
+class GodfathersPizzaSpider(Spider):
     name = "godfathers_pizza"
-    item_attributes = {'brand': "Godfather's Pizza"}
-    allowed_domains = ["tillster.com"]
-    start_urls = [
-        'https://api-prod-gfp-us-a.tillster.com/mobilem8-web-service/rest/storeinfo/distance?_=1601656666666&\
-        disposition=DINE_IN,PICKUP,DELIVERY&latitude=39.0213953&longitude=-94.3116155&maxResults=2000&radius=5000&\
-        statuses=ACTIVE,TEMP-INACTIVE,ORDERING-DISABLED&tenant=gfp-us',
-    ]
+    item_attributes = {"brand": "Godfather's Pizza", "brand_wikidata": "Q5576353"}
+    start_urls = ["https://godfathers.orderexperience.net/locations"]
 
-    def parse(self, response):
-        stores = json.loads(response.body_as_unicode())
+    def parse(self, response: Response, **kwargs: Any) -> Iterable[JsonRequest]:
+        if bundle_path := response.xpath('//script[contains(@src, "/_nuxt/")]/@src').get():
+            yield response.follow(bundle_path, callback=self.parse_token)
 
-        for store in stores["getStoresResult"]["stores"]:
-            properties = {
-                'ref': store["storeName"],
-                'name': store["storeName"],
-                'addr_full': store["street"],
-                'city': store["city"],
-                'state': store["state"],
-                'postcode': store["zipCode"],
-                'country': "US",
-                'lat': store["latitude"],
-                'lon': store["longitude"],
-                'phone': store["phoneNumber"]
-            }
+    def parse_token(self, response: Response, **kwargs: Any) -> Iterable[JsonRequest]:
+        key = re.search(r'key:"([a-f0-9]{40})"', response.text).group(1)
+        yield JsonRequest(
+            url=f"https://oxb.pxsweb.com/api/v1/apps/restaurants/66abfd6ce1b9d093ee0ab75d?key={key}",
+            callback=self.parse_stores,
+        )
 
-            yield GeojsonPointItem(**properties)
+    def parse_stores(self, response: Response, **kwargs: Any) -> Iterable[Feature]:
+        for store in response.json():
+            if store.get("hide_from_picker") or not store.get("loc"):
+                continue
+            item = DictParser.parse(store)
+            if item["name"].startswith("Godfathers Pizza Express") or item["name"].startswith(
+                "Godfather's Pizza Express"
+            ):
+                item["branch"] = item.pop("name").removeprefix("Godfathers Pizza Express").strip(" -")
+                item["name"] = "Godfather's Pizza Express"
+            elif item["name"].startswith("Godfathers Pizza") or item["name"].startswith("Godfather's Pizza"):
+                item["branch"] = (
+                    item.pop("name").removeprefix("Godfathers Pizza").removeprefix("Godfather's Pizza").strip(" -")
+                )
+                item["name"] = "Godfather's Pizza"
+
+            item["lat"], item["lon"] = store["loc"]
+            item["street_address"] = item.pop("addr_full", None)
+            apply_category(Categories.RESTAURANT, item)
+            yield item

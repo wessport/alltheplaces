@@ -1,43 +1,21 @@
-# -*- coding: utf-8 -*-
-import re
+from typing import Iterable
 
-import scrapy
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.storefinders.uberall import UberallSpider
 
-from locations.items import GeojsonPointItem
 
-
-class AldiNordPLSpider(scrapy.Spider):
+class AldiNordPLSpider(UberallSpider):
     name = "aldi_nord_pl"
-    item_attributes = {'brand': 'ALDI Nord', 'brand_wikidata': "Q41171373"}
-    allowed_domains = ['www.aldi.pl']
-    start_urls = [
-        'https://www.aldi.pl/informacje-dla-klienta/wyszukiwarka-sklepu.html',
-    ]
+    item_attributes = {"brand_wikidata": "Q41171373"}
+    key = "ALDINORDPL_3Lul0K0H0Vy47Jz0wGZlN30mchboaO"
 
-    def parse(self, response):
-        urls = response.xpath('//div[@class="mod-stores__multicolumn"]/p/a/@href').extract()
-        is_store_list = response.xpath(
-            '//div[@class="mod mod-stores"]//div[@class="mod-stores__overview-company-tools"]/a/@href').extract()
+    def post_process_item(self, item: Feature, response, feature: dict) -> Iterable[Feature]:
+        if item["name"] == "ALDI [W budowie]":
+            return  # Construction
 
-        if not urls and is_store_list:
-            for store_url in is_store_list:
-                yield scrapy.Request(response.urljoin(store_url), callback=self.parse_store)
-        else:
-            for url in urls:
-                yield scrapy.Request(response.urljoin(url))
+        item["name"] = None  # Take casing from NSI
 
-    def parse_store(self, response):
-        ref = re.search(r'.+/(.+?)/?(?:\.html|$)', response.url).group(1)
-        country = re.search(r'aldi\.(\w{2}?)\/', response.url).group(1)
+        apply_category(Categories.SHOP_SUPERMARKET, item)
 
-        properties = {
-            'ref': ref,
-            'name': response.xpath('//div[@class="mod-overview-intro__content"]/h1/text()').extract_first(),
-            'addr_full': response.xpath('normalize-space(//span[@itemprop="streetAddress"]//text())').extract_first(),
-            'city': response.xpath('normalize-space(//span[@itemprop="addressLocality"]//text())').extract_first(),
-            'postcode': response.xpath('normalize-space(//span[@itemprop="postalCode"]//text())').extract_first(),
-            'country': country,
-            'website': response.url
-        }
-
-        yield GeojsonPointItem(**properties)
+        yield item

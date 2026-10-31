@@ -1,212 +1,359 @@
 import json
-import re
-import scrapy
+from typing import Any
 
-from locations.items import GeojsonPointItem
+import requests
+from chompjs import parse_js_object
+from scrapy.http import Response
 
-
-def load_json(data):
-    try:
-        return json.loads(data)
-    except json.JSONDecodeError:
-        # fix malformed json
-        data = re.sub(r'(:\s*)\'', r'\1"', data) # use double quotes instead of single
-        data = re.sub(r'\'([,\s\}])', r'"\1', data)
-        data = re.sub(r',(\s*\})', r'\1', data)  # remove trailing commas
-        data = re.sub(r'(description": ")[\s\S]*?(",[\n\r])', r'\1\2', data)
-        return json.loads(data)
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.playwright_spider import PlaywrightSpider
+from locations.settings import DEFAULT_PLAYWRIGHT_SETTINGS
+from locations.user_agents import CHROME_LATEST
 
 
-class HiltonSpider(scrapy.Spider):
+class HiltonSpider(PlaywrightSpider):
     name = "hilton"
-    allowed_domains = ["hilton.com", "hiltongrandvacations.com"]
+    start_urls = ["https://www.hilton.com/en/locations/hilton-hotels/"]
+    custom_settings = DEFAULT_PLAYWRIGHT_SETTINGS | {
+        "PLAYWRIGHT_DEFAULT_NAVIGATION_TIMEOUT": 180 * 1000,
+        "ROBOTSTXT_OBEY": False,
+        "DEFAULT_REQUEST_HEADERS": {
+            "User-Agent": CHROME_LATEST,
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+        },
+        "CONCURRENT_REQUESTS": 1,
+        "DOWNLOAD_DELAY": 5,
+        "RETRY_TIMES": 5,
+    }
+    requires_proxy = "US"
 
-    def start_requests(self):
-        sites = [
-            ('Hilton Hotels & Resorts', 'https://www3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Waldorf Astoria Hotels & Resorts', 'https://waldorfastoria3.hilton.com/en/hotels/index.html', self.parse_hotel_list),
-            ('LXR Hotels & Resorts', 'https://lxrhotels3.hilton.com/lxr/locations/', self.parse_lxr),
-            ('Conrad Hotels & Resorts', 'https://conradhotels3.hilton.com/en/hotels/index.html', self.parse_hotel_list),
-            ('Canopy by Hilton', 'https://canopy3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Curio Collection by Hilton', 'https://curiocollection3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Doubletree by Hilton', 'https://doubletree3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Tapestry Collection by Hilton', 'https://tapestrycollection3.hilton.com/tc/locations/',  self.parse_tapestry),
-            ('Embassy Suites', 'https://embassysuites3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Hilton Garden Inn', 'https://hiltongardeninn3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Hampton Inn', 'https://hamptoninn3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Tru by Hilton', 'https://tru3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Homewood Suites by Hilton', 'https://homewoodsuites3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Home2 Suites by Hilton', 'https://home2suites3.hilton.com/en/hotel-locations/index.html', self.parse),
-            ('Hilton Grand Vacations', 'https://www.hiltongrandvacations.com/destinations/', self.parse_grand_vacation),
-            # # ('Motto', '', None)  # no locations yet but "coming soon"
-        ]
-        for site in sites:
-            yield scrapy.Request(url=site[1], callback=site[2], meta={"properties": {"extras": {"brand": site[0]}}})
+    # More details about brand codes is in filters section of https://www.hilton.com/en/locations/hilton-hotels/
+    BRANDS_MAPPING = {
+        "CH": ("Conrad", "Q855525"),
+        "DT": ("DoubleTree", "Q2504643"),
+        "ES": ("Embassy Suites", "Q5369524"),
+        "GI": ("Hilton Garden Inn", "Q1162859"),
+        "GU": ("Graduate", "Q85846030"),
+        "GV": ("Hilton Grand Vacations", "Q13636126"),
+        "HI": ("Hilton", "Q598884"),
+        "HP": ("Hampton", "Q5646230"),
+        "HT": ("Home2 Suites", "Q5887912"),
+        "HW": ("Homewood Suites", "Q5890701"),
+        "LX": ("Small Luxury Hotels of the World", None),
+        "ND": ("NoMad", None),
+        "OL": ("LXR", "Q64605184"),
+        "OU": ("AutoCamp", None),
+        "PE": ("Spark by Hilton", None),
+        "PO": ("Tempo", "Q112144357"),
+        "PY": ("Canopy", "Q30632909"),
+        "QQ": ("Curio Collection", "Q19903229"),
+        "RU": ("Tru", "Q24907770"),
+        "SA": ("Signia", "Q112144335"),
+        "UA": ("Motto", "Q112144350"),
+        "UP": ("Tapestry Collection", "Q109275422"),
+        "WA": ("Waldorf Astoria", "Q3239392"),
+    }
 
-    def parse_hotel_list(self, response):
-        """Different style hotel list"""
-        hotel_urls = response.xpath('//ul[@class="locations"]/li/a/@href').extract()
+    # TODO: map more services
+    SERVICES_MAPPING = {
+        "adjoiningRooms": None,
+        "adventureStays": None,
+        "airportShuttle": None,
+        "allInclusive": None,
+        "beach": None,
+        "boutique": None,
+        "businessCenter": None,
+        "casino": None,
+        "concierge": None,
+        "digitalKey": None,
+        "dining": None,
+        "evCharging": None,
+        "eveningReception": None,
+        "executiveLounge": None,
+        "fitnessCenter": None,
+        "freeBreakfast": None,
+        "freeParking": None,
+        "freeWifi": Extras.WIFI,
+        "golf": None,
+        "hotelResidence": None,
+        "inRoomKitchen": None,
+        "indoorPool": Extras.SWIMMING_POOL,
+        "luxury": None,
+        "meetingRooms": None,
+        "newHotel": None,
+        "nonSmoking": "smoking=no",
+        "outdoorPool": None,
+        "petsAllowed": None,
+        "petsNotAllowed": None,
+        "resort": None,
+        "roomService": None,
+        "ski": None,
+        "spa": None,
+        "streamingTv": None,
+        "tennisCourt": None,
+    }
 
-        for url in hotel_urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_hotel, meta=response.meta)
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for countries in DictParser.iter_matching_keys(
+            parse_js_object(response.xpath('//script[contains(text(), "locationPageUri")]/text()').get()), "countries"
+        ):
+            for country in countries:
+                regions = country.get("states") or country.get("cities")
+                for region in regions:
+                    response = self.get_hotels(region["locationPageUri"])
 
-    def parse_lxr(self, response):
-        """Parse LXR hotel list"""
-        hotel_urls = response.xpath('//section[contains(@class, "location-hotels-wrap")]/section//a/@href').extract()
+                    try:
+                        hotels_summary = response.json()["data"]["geocodePage"].get("hotelSummaryOptions") or {}
+                        for poi in hotels_summary.get("hotels", []):
+                            poi.update(poi.pop("address"))
+                            poi.update(poi.pop("contactInfo"))
+                            item = DictParser.parse(poi)
+                            item["ref"] = poi["ctyhocn"]
+                            item["website"] = poi.get("facilityOverview", {}).get("homeUrlTemplate")
+                            item["lat"] = poi.get("localization", {}).get("coordinate", {}).get("latitude")
+                            item["lon"] = poi.get("localization", {}).get("coordinate", {}).get("longitude")
 
-        for url in hotel_urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_lxr_hotel, meta=response.meta)
+                            if brand_code := poi.get("brandCode"):
+                                if match := self.BRANDS_MAPPING.get(brand_code):
+                                    item["brand"], item["brand_wikidata"] = match
+                                else:
+                                    self.crawler.stats.inc_value(f"atp/{self.name}/unknown_brand/{brand_code}")
 
-    def parse_lxr_hotel(self, response):
-        """Parse LXR hotel page (address parts are not labeled correctly)"""
-        try:
-            address = ", ".join([response.xpath('//span[@itemprop="streetAddress"]/text()').extract_first(),
-                                 response.xpath('//span[@itemprop="addressRegion"]/text()').extract_first()])
-        except:
-            address = response.xpath('//span[@itemprop="streetAddress"]/text()').extract_first()
+                            for service in poi.get("amenityIds", []):
+                                if match := self.SERVICES_MAPPING.get(service):
+                                    apply_yes_no(match, item, True)
+                                else:
+                                    self.crawler.stats.inc_value(f"atp/{self.name}/unknown_service/{service}")
 
-        properties = {
-            "name": response.xpath('//span[@itemprop="name"]/text()').extract_first(),
-            "ref": response.xpath('//link[@rel="canonical"]/@href').re_first('.*/(.*?)/'),
-            "phone": response.xpath('//span[@itemprop="telephone"]//span/text()').extract_first(),
-            "addr_full": address,
-            "city": response.xpath('//span[@itemprop="addressCountry"]/text()').extract_first(),
-            "country": (response.xpath('//span[@itemprop="postalCode"]/text()').extract_first() or "").strip(),
-            "website": response.xpath('//link[@rel="canonical"]/@href').extract_first(),
-            "lat": float(response.xpath('//div[@class="marker"]/@data-lat').extract_first()),
-            "lon": float(response.xpath('//div[@class="marker"]/@data-lng').extract_first())
+                            apply_category(Categories.HOTEL, item)
+                            yield item
+                    except Exception:
+                        self.logger.error(f'Error parsing locations for path: {region["locationPageUri"]}')
+
+    def get_hotels(self, location_url: str):
+        # TODO: we should use JsonRequest here, but it doesn't work with this endpoint for some reason!
+        url = "https://www.hilton.com/graphql/customer?appName=dx_shop_search_app&operationName=hotelSummaryOptions_geocodePage&originalOpName=hotelSummaryOptions_geocodePage&bl=en"
+
+        payload = json.dumps(
+            {
+                "query": """
+                        query hotelSummaryOptions_geocodePage(
+                          $language: String!,
+                          $path: String!,
+                          $queryLimit: Int!,
+                          $currencyCode: String!,
+                          $distanceUnit: HotelDistanceUnit,
+                          $titleFormat: MarkdownFormatType!,
+                          $input: HotelSummaryOptionsInput
+                        ) {
+                          geocodePage(language: $language, path: $path) {
+                            location {
+                              pageInterlinks {
+                                title
+                                links {
+                                  name
+                                  uri
+                                }
+                              }
+                              title(format: $titleFormat)
+                              accessibilityTitle
+                              meta {
+                                pageTitle
+                                description
+                              }
+                              name
+                              brandCode
+                              category
+                              uri
+                              globalBounds
+                              breadcrumbs {
+                                uri
+                                name
+                              }
+                              about {
+                                contentBlocks {
+                                  title(format: text)
+                                  descriptions
+                                  orderedList
+                                  unorderedList
+                                }
+                                contentBlocks_noTx: contentBlocks {
+                                  title(format: text)
+                                  descriptions
+                                  orderedList
+                                  unorderedList
+                                }
+                                isContentLocalized
+                              }
+                              paths {
+                                base
+                              }
+                              hotelSummaryExtractUrl
+                            }
+                            match {
+                              address {
+                                city
+                                country
+                                countryName
+                                state
+                                stateName
+                              }
+                              geometry {
+                                location {
+                                  latitude
+                                  longitude
+                                }
+                                bounds {
+                                  northeast {
+                                    latitude
+                                    longitude
+                                  }
+                                  southwest {
+                                    latitude
+                                    longitude
+                                  }
+                                }
+                              }
+                              id
+                              name
+                              type
+                            }
+                            hotelSummaryOptions(
+                              distanceUnit: $distanceUnit
+                              sortBy: distance
+                              input: $input
+                            ) {
+                              _hotels {
+                                totalSize
+                              }
+                              bounds {
+                                northeast {
+                                  latitude
+                                  longitude
+                                }
+                                southwest {
+                                  latitude
+                                  longitude
+                                }
+                              }
+                              amenities {
+                                id
+                                name
+                                hint
+                              }
+                              amenityCategories {
+                                name
+                                id
+                                amenityIds
+                              }
+                              brands {
+                                code
+                                name
+                              }
+                              hotels(first: $queryLimit) {
+                                amenityIds
+                                brandCode
+                                ctyhocn
+                                distance
+                                distanceFmt
+                                facilityOverview {
+                                  allowAdultsOnly
+                                  homeUrlTemplate
+                                }
+                                name
+                                contactInfo {
+                                  phoneNumber
+                                }
+                                display {
+                                  open
+                                  openDate
+                                  preOpenMsg
+                                  resEnabled
+                                  resEnabledDate
+                                  treatments
+                                }
+                                disclaimers {
+                                  desc
+                                  type
+                                }
+                                address {
+                                  addressFmt
+                                  addressLine1
+                                  city
+                                  country
+                                  countryName
+                                  postalCode
+                                  state
+                                  stateName
+                                }
+                                localization {
+                                  currencyCode
+                                  coordinate {
+                                    latitude
+                                    longitude
+                                  }
+                                }
+                                images {
+                                  master(ratios: [threeByTwo]) {
+                                    altText
+                                    ratios {
+                                      size
+                                      url
+                                    }
+                                  }
+                                  carousel(ratios: [threeByTwo]) {
+                                    altText
+                                    ratios {
+                                      url
+                                      size
+                                    }
+                                  }
+                                }
+                                leadRate {
+                                  lowest {
+                                    cmaTotalPriceIndicator
+                                    feeTransparencyIndicator
+                                    rateAmount(currencyCode: $currencyCode)
+                                    rateAmountFmt(decimal: 0, strategy: ceiling)
+                                    ratePlanCode
+                                    ratePlan {
+                                      ratePlanName @toTitleCase
+                                      ratePlanDesc
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                            ctyhocnList: hotelSummaryOptions(distanceUnit: $distanceUnit, sortBy: distance) {
+                              hotelList: hotels {
+                                ctyhocn
+                              }
+                            }
+                          }
+                          geocodePageEn: geocodePage(language: "en", path: $path) {
+                            match {
+                              name
+                            }
+                          }
+                        }
+                """,
+                "operationName": "hotelSummaryOptions_geocodePage",
+                "variables": {
+                    "path": location_url,
+                    "language": "en",
+                    "queryLimit": 150,  # server-enforced maximum
+                    "currencyCode": "USD",
+                    "titleFormat": "md",
+                    "input": {"guestLocationCountry": "US"},
+                },
+            }
+        )
+        headers = {
+            "content-type": "application/json",
         }
-        properties.update(response.meta["properties"])
-        yield GeojsonPointItem(**properties)
 
-    def parse_tapestry(self, response):
-        """Parse Tapestry Collection hotel list"""
-        script = "".join(response.xpath('//script/text()').extract())
-        hotels = re.split(r'hotels\.[\d]+\.address":', script)
-
-        for hotel in hotels[1:]:
-            code = re.search(r'ctyhocn":"(.*?)"', hotel).groups()[0]
-            lat = re.search(r'latitude":([\d\-\.]+)', hotel).groups()[0]
-            lon = re.search(r'longitude":([\d\-\.]+)', hotel).groups()[0]
-            properties = {
-                "ref": code,
-                "lat": float(lat),
-                "lon": float(lon)
-            }
-            properties.update(response.meta["properties"])
-            payload = {"operationName":"hotel","variables":{"ctyhocn":code,"language":"en"},
-                       "query":"query hotel($ctyhocn: String!, $language: String!) {\n  hotel(ctyhocn: $ctyhocn, language: $language) {\n    address {\n      addressFmt\n    }\n    brandCode\n    galleryImages(numPerCategory: 2, first: 12) {\n      alt\n      hiResSrc(height: 430, width: 950)\n      src\n    }\n    homepageUrl\n    name\n    open\n    openDate\n    phoneNumber\n    resEnabled\n    amenities(filter: {groups_includes: [hotel]}) {\n      id\n      name\n    }\n  }\n}\n"}
-
-            yield scrapy.Request(url="https://www.hilton.com/graphql/customer?appName=dx-brands-ui&operationName=hotel&pod=brands",
-                                 method='POST',
-                                 body=json.dumps(payload),
-                                 headers={"Content-Type": "application/json"},
-                                 meta={'properties': properties},
-                                 callback=self.parse_tapestry_hotel)
-
-    def parse_tapestry_hotel(self, response):
-        """Parse Tapestry hotel page"""
-        properties = response.meta["properties"]
-        data = json.loads(response.body_as_unicode())
-
-        if not data["data"].get("hotel"):
-            return
-
-        url = data["data"]["hotel"]["homepageUrl"]
-        if url.startswith('/'):
-            url = "https:" + url
-
-        properties.update({
-            "addr_full": data["data"]["hotel"]["address"]["addressFmt"],
-            "name": data["data"]["hotel"]["name"],
-            "phone": data["data"]["hotel"]["phoneNumber"],
-            "website": url,
-        })
-        yield GeojsonPointItem(**properties)
-
-
-    def parse_grand_vacation_hotel(self, response):
-        """Parse Grand Vacation hotel resort page"""
-        properties = response.meta["properties"]
-        lat, lon = response.xpath('//script/text()').re_first(r'.*google.maps.LatLng\(\s*(.*)\s+\);').split(',')
-        properties.update({
-            "name": response.xpath('//div[contains(@class, "resort-title")]//h1/text()').extract_first(),
-            "ref":  "_".join(re.search(r'.*/(.*)/(.*)/', response.url).groups()),
-            "lat": float(lat),
-            "lon": float(lon),
-            "website": response.url
-        })
-        yield GeojsonPointItem(**properties)
-
-    def parse_grand_vacation(self, response):
-        """Parse Hilton Grand Vacations resort list"""
-        resorts = response.xpath('//div[contains(@class, "resortpanel")]')
-
-        for resort in resorts:
-            url = resort.xpath('.//a/@href').extract_first()
-            location = resort.xpath('.//p[@class="location"]/text()').extract_first().split(',')
-            properties = dict()
-            properties["country"] = location.pop().strip()
-            properties["state"] = location.pop().strip()
-            properties["city"] = ", ".join(location)
-            properties.update(response.meta["properties"])
-
-            yield scrapy.Request(response.urljoin(url),
-                                 callback=self.parse_grand_vacation_hotel,
-                                 meta={"properties": properties})
-
-    def parse_hotel(self, response):
-        """Parse generic hotel page"""
-        data = response.xpath('//script[@type="application/ld+json" and contains(text(), "streetAddress")]/text()').extract_first()
-
-        if data:
-            data = load_json(data)
-
-            properties = {
-                'name': data["name"],
-                'ref': re.search(r'.*/(.*)/(?:index.html)?', response.url).group(1),
-                'addr_full': data["address"]["streetAddress"],
-                'city': data["address"]["addressLocality"],
-                'state': data["address"]["addressRegion"],
-                'postcode': data["address"]["postalCode"],
-                'country': data["address"]["addressCountry"],
-                'phone': data.get("telephone"),
-                'website': data.get("url") or response.url,
-                'lat': float(data["geo"]["latitude"]),
-                'lon': float(data["geo"]["longitude"]),
-            }
-
-        else:
-            try:
-                lat, lon = response.xpath('//meta[@name="geo.position"]/@content').extract_first().split(';')
-            except:
-                lat, lon = None, None
-
-            properties = {
-                "name": response.xpath('//meta[@name="og:title"]/@content').extract_first(),
-                "ref": re.search(r'.*/(.*)/(?:index.html)?', response.url).group(1),
-                "phone": response.xpath('//span[@class="property-telephone"]/text()').extract_first(),
-                "addr_full": (response.xpath('//span[@class="property-streetAddress"]/text()').extract_first() or "").strip(),
-                "city": response.xpath('//span[@class="property-addressLocality"]/text()').extract_first(),
-                "state": response.xpath('//span[@class="property-addressRegion"]/text()').extract_first(),
-                "country": response.xpath('//span[@class="property-addressCountry"]/text()').extract_first(),
-                "postcode": response.xpath('//span[@class="property-postalCode"]/text()').extract_first(),
-                "lat": float(lat) if lat else None,
-                "lon": float(lon) if lon else None,
-                "website": response.url
-            }
-
-        properties.update(response.meta["properties"])
-        yield GeojsonPointItem(**properties)
-
-    def parse(self, response):
-        """Parse generic hotel listings"""
-        hotel_urls = response.xpath('//ul[@class="directory_hotels_list"]/li/a/@href').extract()
-        if hotel_urls:
-            for url in hotel_urls:
-                yield scrapy.Request(response.urljoin(url), callback=self.parse_hotel, meta=response.meta)
-
-        else:
-            urls = response.xpath('//ul[@class="directory_locations_list"]/li/a/@href').extract()
-            for url in urls:
-                yield scrapy.Request(response.urljoin(url), meta=response.meta)
+        return requests.post(url, headers=headers, data=payload)

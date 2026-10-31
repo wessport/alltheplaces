@@ -1,45 +1,56 @@
-# -*- coding: utf-8 -*-
-import scrapy
+import re
+from typing import Any
 
-from locations.items import GeojsonPointItem
+from scrapy.http import Response
+from scrapy.linkextractors import LinkExtractor
+from scrapy.spiders import CrawlSpider, Rule
+
+from locations.categories import Categories, apply_category
+from locations.hours import OpeningHours
+from locations.items import Feature
 
 
-class ShakeShackSpider(scrapy.Spider):
+class ShakeShackSpider(CrawlSpider):
     name = "shake_shack"
-    item_attributes = { 'brand': "Shake Shack" }
-    allowed_domains = ["www.shakeshack.com"]
-    start_urls = (
-        'https://www.shakeshack.com/locations/',
-    )
+    item_attributes = {"brand": "Shake Shack", "brand_wikidata": "Q1058722"}
+    start_urls = ["https://shakeshack.com/locations"]
+    rules = [Rule(LinkExtractor(allow=r"/node/\d+$"), callback="parse_location")]
+    custom_settings = {"DOWNLOAD_DELAY": 2, "CONCURRENT_REQUESTS": 2}
+    requires_proxy = True
 
-    def parse(self, response):
-        locations = response.xpath('//a[contains(@href, "location/")]')
+    def parse_location(self, response: Response, **kwargs: Any) -> Any:
+        item = Feature()
+        item["ref"] = item["website"] = response.url
+        item["branch"] = response.xpath("normalize-space(//h1)").get()
+        item["street_address"] = response.xpath(
+            '//*[contains(@class, "field--name-field-address-line-1-ss2")]/text()'
+        ).get()
+        city_state = response.xpath(
+            'normalize-space(//h2[contains(@class, "field--name-field-hero-description")])'
+        ).get()
+        item["city"], _, item["state"] = (part.strip() for part in city_state.partition(","))
+        item["postcode"] = response.xpath(
+            'normalize-space(//*[@id="location-info--left__address"]/text()[normalize-space()][last()])'
+        ).re_first(r"(\d{5}(?:-\d{4})?)\s*$")
+        item["country"] = "US"
+        item["lat"] = response.xpath("//@data-lat").get()
+        item["lon"] = response.xpath("//@data-lng").get()
+        phone = response.xpath(
+            '//*[@id="location-info--left__phone"]//div[contains(@class, "field__item")]/text()'
+        ).get()
+        if phone and not re.sub(r"\D", "", phone).endswith("5555555"):
+            item["phone"] = phone
 
-        for location in locations:
-            location_url = location.xpath('@href').extract()[0]
-            full_url = response.urljoin(location_url)
-            yield scrapy.Request(
-                full_url,
-                callback=self.parse_location,
-            )
+        item["opening_hours"] = OpeningHours()
+        for day in response.xpath('//*[@id="location-info--middle__hours"]/div'):
+            if hours := day.xpath('normalize-space(.//*[@class="location--hours"])').get():
+                open_time, _, close_time = hours.partition("–")
+                item["opening_hours"].add_range(
+                    day.xpath('normalize-space(.//*[@class="location--weekend"])').get(),
+                    open_time.strip(),
+                    close_time.strip(),
+                    "%I:%M %p",
+                )
 
-    
-    def parse_location(self, response):
-        cityState = response.xpath('//h1[@class="sr-only"]/text()').extract_first()
-        city = cityState.split(",")[-2]
-        state= cityState.split(",")[-1]
-        phone=response.xpath('//div[@class="span4 address"]/p/text()').extract()[-1].strip()
-        fullAddress = response.xpath('//div[@id="map-infowindow"]/p/text()').extract_first()
-        fullAddressArray = fullAddress.split(",")
-        postcode = fullAddressArray[-1].split(" ")[-1].strip()
-
-
-        yield GeojsonPointItem(
-            name=cityState,
-            ref=cityState,
-            addr_full=fullAddress,
-            city=city,
-            state=state,
-            postcode=postcode,
-            phone=phone,
-        )
+        apply_category(Categories.FAST_FOOD, item)
+        yield item

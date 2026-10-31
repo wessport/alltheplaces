@@ -1,47 +1,36 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-import re
+from chompjs import chompjs
+from scrapy.spiders import SitemapSpider
 
-from locations.items import GeojsonPointItem
+from locations.dict_parser import DictParser
+from locations.hours import CLOSED_EN, OpeningHours
 
 
-class LjsilversSpider(scrapy.Spider):
+class LjsilversSpider(SitemapSpider):
     name = "ljsilvers"
-    item_attributes = { 'brand': "Long John Silver's", 'brand_wikidata': "Q1535221" }
-    allowed_domains = ["ljsilvers.com"]
-    start_urls = (
-        'http://www.ljsilvers.com/locator?postalcode=76010',
-    )
+    item_attributes = {"brand": "Long John Silver's", "brand_wikidata": "Q1535221"}
 
-    def parse(self, response):
-        data = response.body_as_unicode()
-        base_data = re.search(r'dataout\s--Array\s\((.*)\)\s\s--><style type="text/css">', data, re.DOTALL).group(1)
-        detail_matches = re.findall(r'\((.*?)\)', base_data, re.DOTALL)
+    sitemap_urls = ["https://www.ljsilvers.com/sitemap.xml"]
+    sitemap_rules = [(r"https://www.ljsilvers.com/locations/\w+\/", "parse")]
 
-        for detail_match in detail_matches:
-            key_values = re.findall(r'(.*?)\s=>\s(.*)', detail_match)
-            props = {}
+    def parse(self, response, **kwargs):
+        if data := chompjs.parse_js_object(
+            response.xpath('//script[contains(text(), "window.__NUXT__")]/text()').re_first(r"location:({.*})}\]")
+        ):
+            item = DictParser.parse(data)
+            item["ref"] = item["website"] = response.url
+            item.pop("name", None)
+            item["opening_hours"] = OpeningHours()
+            for row in response.xpath(r'//*[@class="hours"]/div'):
+                day = row.xpath(".//p[1]/text()").get()
+                if not (time := row.xpath(".//p[2]/text()").get()):
+                    continue
+                if time.strip().lower() in CLOSED_EN:
+                    item["opening_hours"].set_closed(day)
+                    continue
+                open_time, close_time = time.split("-")
+                item["opening_hours"].add_range(
+                    day=day, open_time=open_time.strip(), close_time=close_time.strip(), time_format="%I:%M %p"
+                )
 
-            for key_value in key_values:
-                key = key_value[0].strip()
-                value = key_value[1].strip()
-
-                if key == '[storeID]':
-                    props['ref'] = value
-                if key == '[address]':
-                    props['addr_full'] = value
-                if key == '[city]':
-                    props['city'] = value
-                if key == '[state]':
-                    props['state'] = value
-                if key == '[zip]':
-                    props['postcode'] = value
-                if key == '[phone_number]':
-                    props['phone'] = value
-                if key == '[latitude]':
-                    props['lat'] = value
-                if key == '[longitude]':
-                    props['lon'] = value
-
-            yield GeojsonPointItem(**props)
+            item["street_address"] = item.pop("addr_full", None)
+            yield item

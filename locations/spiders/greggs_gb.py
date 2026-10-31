@@ -1,0 +1,61 @@
+from datetime import datetime
+from typing import Any
+
+from scrapy import Spider
+from scrapy.http import Response
+
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS, OpeningHours
+from locations.pipelines.address_clean_up import clean_address
+
+
+class GreggsGBSpider(Spider):
+    name = "greggs_gb"
+    item_attributes = {"brand": "Greggs", "brand_wikidata": "Q3403981"}
+    start_urls = ["https://production-digital.greggs.co.uk/api/v1.0/shops"]
+
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for store in response.json():
+            store["address"]["street_address"] = clean_address(
+                [
+                    store["address"].pop("houseNumberOrName"),
+                    store["address"].pop("streetName"),
+                ]
+            )
+            item = DictParser.parse(store["address"])
+
+            if store["shopName"].startswith("Outlet: "):
+                item["name"] = "Greggs Outlet"
+                item["branch"] = store["shopName"].removeprefix("Outlet: ")
+            elif store["shopName"].endswith(" Bitesize"):
+                item["name"] = "Bitesize Greggs"
+                item["branch"] = store["shopName"].removesuffix(" Bitesize")
+            else:
+                item["name"] = "Greggs"
+                item["branch"] = store["shopName"]
+
+            item["phone"] = store["address"]["phoneNumber"]
+            item["ref"] = store["shopCode"]
+            item["website"] = f'https://www.greggs.com/shop-finder?shop-code={store["shopCode"]}'
+            item["opening_hours"] = self.decode_hours(store)
+            item["extras"]["cuisine"] = "sandwich;bakery"
+            apply_yes_no(Extras.DRIVE_THROUGH, item, store.get("driveThrough"))
+
+            apply_category(Categories.FAST_FOOD, item)
+
+            yield item
+
+    @staticmethod
+    def decode_hours(store):
+        oh = OpeningHours()
+        for r in store["tradingPeriods"]:
+            # Each day has a record like:
+            # {'openingTime': '2022-08-30T06:00:00Z', 'closingTime': '2022-08-30T18:00:00Z'}
+            # Do not believe their Zulu time modifier, it is local time.
+            oh.add_range(
+                DAYS[datetime.fromisoformat(r["openingTime"][0:10]).weekday()],
+                r["openingTime"][-9:-4],
+                r["closingTime"][-9:-4],
+            )
+        return oh

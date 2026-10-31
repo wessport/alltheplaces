@@ -1,101 +1,102 @@
-# -*- coding: utf-8 -*-
-import json
+from typing import AsyncIterator
 
-import scrapy
+from scrapy import Spider
+from scrapy.http import JsonRequest
 
+from locations.dict_parser import DictParser
 from locations.hours import OpeningHours
-from locations.items import GeojsonPointItem
 
-STATES = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DC', 'DE', 'FL', 'GA',
-          'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
-          'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
-          'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
-          'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY']
-
-DAY_MAPPING = [
-    "Mo",
-    "Tu",
-    "We",
-    "Th",
-    "Fr",
-    "Sa",
-    "Su"
-]
-
-URL = 'https://insomniacookies.com/locations/searchStores'
-
-
-class InsomniaCookiesSpider(scrapy.Spider):
-    name = "insomnia_cookies"
-    allowed_domains = ['insomniacookies.com']
-    start_urls = ['https://insomniacookies.com/locations']
-    download_delay = 5.0
-    custom_settings = {
-        'USER_AGENT': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/73.0.3683.86 Safari/537.36',
-        'CONCURRENT_REQUESTS': '1'
+COUNTRIES_QUERY = """query COUNTRIES($countryId: ID) {
+  countries(countryId: $countryId) {
+    all {
+      api_url
+      id
+      iso3166_code
+      url
     }
+  }
+}"""
 
-    def parse(self, response):
-        url = URL
+STORES_QUERY = """{
+  regularStores {
+    address
+    city
+    countryId
+    email
+    id
+    lat
+    lng
+    mailingAddress
+    name
+    phone
+    slug
+    state
+    storefrontImage
+    zip
+    hours {
+      type
+      days {
+        day
+        hour
+      }
+    }
+  }
+}"""
 
-        headers = {
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Origin': 'https://insomniacookies.com',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Referer': 'https://insomniacookies.com/locations',
-            'Connection': 'keep-alive',
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            '_token': 'E6o8X3DWy5H5PM3QZnjjPJ0Dn6TiVUNKbVV3gsUb'
-        }
 
-        for state in STATES:
-            form_data = {'state': state}
+class InsomniaCookiesSpider(Spider):
+    name = "insomnia_cookies"
+    item_attributes = {"brand": "Insomnia Cookies", "brand_wikidata": "Q16997024"}
 
-            yield scrapy.http.FormRequest(url=url, method='POST', formdata=form_data, headers=headers,
-                                          callback=self.parse_stores)
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        # First get a list of countries with their IDs, websites, and API
+        # endpoints.
+        yield JsonRequest(
+            "https://api.insomniacookies.com/graphql",
+            data={"query": COUNTRIES_QUERY},
+            callback=self.parse_countries,
+        )
 
-    def parse_hours(self, store_data):
-        opening_hours = OpeningHours()
+    def parse_countries(self, response):
+        countries = response.json()["data"]["countries"]["all"]
+        for country in countries:
+            yield JsonRequest(
+                country["api_url"] + "/graphql",
+                data={
+                    "query": STORES_QUERY,
+                },
+                headers={
+                    "selected-country": country["id"],
+                },
+                callback=self.parse_stores,
+                cb_kwargs={"countries": countries},
+            )
 
-        for day in DAY_MAPPING:
-            open_time = store_data["store_info"]["store_open"]
-            close_time = store_data["store_info"]["store_close"]
-            if open_time and close_time:
-                # Handle inconsistent time formats
-                if open_time.count(':') == 1:
-                    open_time = ':00 '.join(open_time.split())
-                if close_time.count(':') == 1:
-                    close_time = ':00 '.join(close_time.split())
+    def parse_stores(self, response, countries):
+        for error in response.json().get("errors", []):
+            self.logger.error(error["message"])
+        for store in response.json()["data"]["regularStores"]:
+            item = DictParser.parse(store)
+            item["ref"] = f'{store["countryId"]}:{item["ref"]}'
+            item["branch"] = item.pop("name")
+            item["street_address"] = store["mailingAddress"]
+            item["image"] = store["storefrontImage"]
 
-                opening_hours.add_range(day=day, open_time=open_time.strip(), close_time=close_time.strip(),
-                                        time_format='%I:%M:%S %p')
+            store_countries = [c for c in countries if c["id"] == store["countryId"]]
+            if len(store_countries) == 0:
+                self.logger.warn(f"Can't find country ID {store['countryId']!r}")
+            else:
+                country = store_countries[0]
+                item["country"] = country["iso3166_code"]
+                item["extras"]["website:menu"] = f"{country['url']}/menu/{store['slug']}"
 
-        return opening_hours.as_opening_hours()
+            for hours in store["hours"]:
+                oh = OpeningHours()
+                for day in hours["days"]:
+                    oh.add_ranges_from_string(f"{day['day']} {day['hour']}")
+                if hours["type"] == "Retail Hours":
+                    item["opening_hours"] = oh
+                elif hours["type"] == "Delivery Hours":
+                    item["extras"]["opening_hours:delivery"] = oh.as_opening_hours()
 
-    def parse_stores(self, response):
-
-        data = json.loads(response.body_as_unicode())
-        stores = data["stores"]
-
-        if stores:
-            for store in stores:
-
-                properties = {
-                    'name': store["store_info"]["name"].strip(),
-                    'ref': store["store_info"]["id"],
-                    'addr_full': store["store_info"]["address"].strip(),
-                    'city': store["store_info"]["city"].strip(),
-                    'state': store["store_info"]["state"].strip(),
-                    'postcode': store["store_info"]["zip"].strip(),
-                    'phone': store["store_info"].get("phone"),
-                    'website': response.url,
-                    'lat': float(store["store_info"]["store_lat"]),
-                    'lon': float(store["store_info"]["store_lon"])
-                }
-
-                hours = self.parse_hours(store)
-                if hours:
-                    properties["opening_hours"] = hours
-
-                yield GeojsonPointItem(**properties)
+            yield item

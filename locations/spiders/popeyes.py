@@ -1,110 +1,95 @@
-# -*- coding: utf-8 -*-
-import json
-import re
-import scrapy
+from typing import Any, AsyncIterator
+from urllib.parse import urljoin
 
-from locations.items import GeojsonPointItem
+from scrapy.http import JsonRequest, Response
+from scrapy.spiders import Spider
 
-HOURS_XPATH = 'normalize-space(//div[starts-with(@class, "hours-section ")])'
+from locations.categories import Extras, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS, OpeningHours
+from locations.pipelines.address_clean_up import merge_address_lines
 
 
-def replacement(x):
-    return "##" + x.group().strip()
-
-class PopeyesSpider(scrapy.Spider):
-
+class PopeyesSpider(Spider):
     name = "popeyes"
-    item_attributes = { 'brand': "Popeyes Louisiana Kitchen", 'brand_wikidata': "Q1330910" }
-    allowed_domains = ["www.popeyes.com", "locations.popeyes.com"]
-    download_delay = 0.2
-    start_urls = (
-        'https://locations.popeyes.com/',
-    )
+    item_attributes = {"brand": "Popeyes", "brand_wikidata": "Q1330910"}
 
-    def normalize_hours(self, hours):
-        all_days = []
-        reversed_hours = {}
-        day_hours = hours.replace('Open 24 Hours', '').replace('DINE-IN HOURS', '').replace(
-                                  'AM', '').replace('PM','').replace('-', '').strip()
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for country in ["us", "fr", "ca", "kr", "ro"]:
+            yield JsonRequest(
+                f"https://czqk28jt.apicdn.sanity.io/v1/graphql/prod_plk_{country}/default",
+                data={"query": """query AllRestaurants {
+                        allRestaurants(limit: -1, where: { environment: "prod", status: "Open" }) {
+                            check_date: _updatedAt
+                            ref: _id
+                            latitude
+                            longitude
+                            addr_full: name
+                            address: physicalAddress {
+                                address1
+                                address2
+                                city
+                                state: stateProvinceShort
+                                postalCode
+                                country
+                            }
+                            phone: phoneNumber
+                            hasDelivery
+                            hasDineIn
+                            hasTakeOut
+                            hasDriveThru
+                            driveThruLaneType
+                            hasPlayground
+                            playgroundType
+                            hasParking
+                            hasWifi
+                            isHalal
+                            operator: franchiseGroupName
+                            diningRoomHours {
+                                MoOpen: monOpen
+                                MoClose: monClose
+                                TuOpen: tueOpen
+                                TuClose: tueClose
+                                WeOpen: wedOpen
+                                WeClose: wedClose
+                                ThOpen: thrOpen
+                                ThClose: thrClose
+                                FrOpen: friOpen
+                                FrClose: friClose
+                                SaOpen: satOpen
+                                SaClose: satClose
+                                SuOpen: sunOpen
+                                SuClose: sunClose
+                            }
+                        }
+                    }
+                    """},
+            )
 
-        day_hours = re.sub(r'Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday', replacement, day_hours)
-        day_hours = [x for x in filter(None, day_hours.split('##'))]
-
-
-        for day_hour in day_hours:
-            d_hr = [x for x in day_hour.split(' ') if x]
-            if len(d_hr) == 3:
-                short_day = d_hr[0].strip().title()[:2]
-                to_hr = '{}:{}'.format(int(d_hr[2].split(':')[0]) + 12, d_hr[2].split(':')[1])
-                from_hr = '{}:{}'.format(int(d_hr[1].split(':')[0]) + 12, d_hr[1].split(':')[1])
-                epoch = '{}-{}'.format(from_hr.strip(), to_hr.strip())
-            else:
-                short_day = d_hr[0].strip().title()[:2]
-                epoch = '00:00-24:00'
-
-            reversed_hours.setdefault(epoch, [])
-            reversed_hours[epoch].append(short_day)
-        if len(reversed_hours) == 1 and list(reversed_hours)[0] == '00:00-24:00':
-            return '24/7'
-        opening_hours = []
-        for key, value in reversed_hours.items():
-            if len(value) == 1:
-                opening_hours.append('{} {}'.format(value[0], key))
-            else:
-                opening_hours.append(
-                    '{}-{} {}'.format(value[0], value[-1], key))
-        return "; ".join(opening_hours)
-
-
-
-    def parse_location(self, location):
-
-        opening_hours = self.normalize_hours(location.xpath(HOURS_XPATH).extract_first())
-        props = {
-            'addr_full': location.xpath(
-                '//meta[@property="restaurant:contact_info:street_address"]/@content').extract_first(),
-            'lon': float(location.xpath(
-                '//meta[@property="place:location:longitude"]/@content').extract_first()),
-            'lat': float(location.xpath(
-                '//meta[@property="place:location:latitude"]/@content').extract_first()),
-            'city': location.xpath(
-                '//meta[@property="restaurant:contact_info:locality"]/@content').extract_first(),
-            'postcode': location.xpath(
-                '//meta[@property="restaurant:contact_info:postal_code"]/@content').extract_first(),
-            'state': location.xpath(
-                '//meta[@property="restaurant:contact_info:region"]/@content').extract_first(),
-            'phone': location.xpath(
-                '//meta[@property="restaurant:contact_info:phone_number"]/@content').extract_first(),
-            'ref': location.url,
-            'website': location.url,
-            'opening_hours': opening_hours
-        }
-        return GeojsonPointItem(**props)
-
-    def parse_city_stores(self, city):
-
-        locations = city.xpath(
-            '//a[@linktrack="Landing page"]/@href').extract()
-
-        for location in locations:
-            yield scrapy.Request(url=city.urljoin(location),
-                                 callback=self.parse_location
-                                 )
-
-    def parse_state(self, state):
-
-        cities = state.xpath(
-            '//a[@linktrack="State index"]/@href').extract()
-        for city in cities:
-            yield scrapy.Request(url=state.urljoin(city),
-                                 callback=self.parse_city_stores
-                                 )
-
-    def parse(self, response):
-
-        states = response.xpath(
-            '//a[@linktrack="State index"]/@href').extract()
-        for state in states:
-            yield scrapy.Request(url=response.urljoin(state),
-                                 callback=self.parse_state
-                                 )
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for location in response.json()["data"]["allRestaurants"]:
+            if "Partner" in location.get("addr_full", "").title():  # Not a Popeyes branded location
+                continue
+            item = DictParser.parse(location)
+            item["website"] = urljoin("https://www.popeyes.com/store-locator/store/", item["ref"])
+            item["extras"]["check_date"] = location["check_date"]
+            item["operator"] = location["operator"]
+            item["addr_full"] = location["addr_full"]
+            item["street_address"] = merge_address_lines(
+                [location["address"]["address1"], location["address"]["address2"]]
+            )
+            apply_yes_no(Extras.DELIVERY, item, location["hasDelivery"])
+            apply_yes_no(Extras.INDOOR_SEATING, item, location["hasDineIn"])
+            apply_yes_no(Extras.TAKEAWAY, item, location["hasTakeOut"])
+            apply_yes_no(Extras.DRIVE_THROUGH, item, location["hasDriveThru"])
+            apply_yes_no(Extras.WIFI, item, location["hasWifi"])
+            apply_yes_no(Extras.HALAL, item, location["isHalal"])
+            item["opening_hours"] = OpeningHours()
+            for day in DAYS:
+                item["opening_hours"].add_range(
+                    day,
+                    location["diningRoomHours"]["{}Open".format(day)],
+                    location["diningRoomHours"]["{}Close".format(day)],
+                    "%Y-%m-%d %H:%M:%S",
+                )
+            yield item

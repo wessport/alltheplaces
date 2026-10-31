@@ -1,0 +1,71 @@
+from typing import AsyncIterator, Iterable
+
+from scrapy import Spider
+from scrapy.http import JsonRequest, TextResponse
+
+from locations.dict_parser import DictParser
+from locations.hours import DAYS, OpeningHours
+from locations.items import Feature
+from locations.pipelines.address_clean_up import merge_address_lines
+
+
+class WoosmapSpider(Spider):
+    """
+    Documentation available at:
+    https://developers.woosmap.com/products/search-api/get-started/
+
+    To use this spider, supply the API 'key' which typically starts with
+    'woos-' followed by a UUID. Also supply a value for 'origin' which is the
+    HTTP 'Origin' header value, typically similar to
+    'https://www.brandname.example'.
+    """
+
+    dataset_attributes: dict = {"source": "api", "api": "woosmap.com"}
+
+    key: str
+    origin: str
+
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        yield JsonRequest(
+            url=f"https://api.woosmap.com/stores?key={self.key}&stores_by_page=300&page=1",
+            headers={"Origin": self.origin},
+            meta={"referrer_policy": "no-referrer"},
+        )
+
+    def parse(self, response: TextResponse) -> Iterable[Feature | JsonRequest]:
+        if features := response.json()["features"]:
+            for feature in features:
+                item = DictParser.parse(feature["properties"])
+
+                if address_lines := feature["properties"]["address"]["lines"]:
+                    item["street_address"] = merge_address_lines(address_lines)
+                item["geometry"] = feature["geometry"]
+
+                item["opening_hours"] = OpeningHours()
+                for day, rules in feature["properties"].get("opening_hours", {}).get("usual", {}).items():
+                    for hours in rules:
+                        if hours.get("all-day"):
+                            start = "00:00"
+                            end = "24:00"
+                        else:
+                            start = hours["start"]
+                            end = hours["end"]
+                        if day == "default":
+                            item["opening_hours"].add_days_range(DAYS, start, end)
+                        else:
+                            item["opening_hours"].add_range(DAYS[int(day) - 1], start, end)
+
+                yield from self.parse_item(item, feature) or []
+
+        if pagination := response.json()["pagination"]:
+            current_page = int(pagination["page"])
+            total_pages = int(pagination["pageCount"])
+            if current_page < total_pages:
+                yield JsonRequest(
+                    url=f"https://api.woosmap.com/stores?key={self.key}&stores_by_page=300&page={current_page + 1}",
+                    headers={"Origin": self.origin},
+                    meta={"referrer_policy": "no-referrer"},
+                )
+
+    def parse_item(self, item: Feature, feature: dict) -> Iterable[Feature]:
+        yield item

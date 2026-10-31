@@ -1,86 +1,131 @@
-# -*- coding: utf-8 -*-
-import json
+from typing import AsyncIterator, Iterable
 
-import scrapy
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
 
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.geo import country_iseadgg_centroids
 from locations.hours import OpeningHours
-
-DAY_MAPPING = {'Sunday': 'Su', 'Monday': 'Mo', 'Tuesday': 'Tu', 'Wednesday': 'We', 'Thursday': 'Th', 'Friday': 'Fr',
-               'Saturday': 'Sa'}
-BASE_URL = 'https://api.capitalone.com/locations'
+from locations.items import Feature
+from locations.pipelines.address_clean_up import clean_address
 
 
-class CapitalOneSpider(scrapy.Spider):
+class CapitalOneSpider(Spider):
     name = "capital_one"
-    item_attributes = {'brand': 'Capital One', 'brand_wikidata': 'Q1034654'}
-    allowed_domains = ['api.capitalone.com']
-    download_delay = 0.5
+    item_attributes = {"brand": "Capital One", "brand_wikidata": "Q1034654"}
+    allowed_domains = ["api.capitalone.com"]
+    start_urls = ["https://api.capitalone.com/locations"]
 
-    def parse_hours(self, hours):
+    @staticmethod
+    def parse_hours(rules: [dict]) -> OpeningHours:
         opening_hours = OpeningHours()
+        for day in rules:
+            opening_hours.add_range(
+                day=day["day"], open_time=day["open"], close_time=day["close"], time_format="%I:%M %p"
+            )
 
-        for weekday in hours:
-            day = DAY_MAPPING[weekday["day"]]
-            open_time = weekday["open"]
-            if open_time == "Closed":
-                continue
-            close_time = weekday["open"]
-            opening_hours.add_range(day=day, open_time=open_time, close_time=close_time, time_format='%I:%M %p')
-        return opening_hours.as_opening_hours()
+        return opening_hours
 
-    def start_requests(self):
-        with open('./locations/searchable_points/us_centroids_50mile_radius.csv') as points:
-            next(points)  # Ignore the header
-            for point in points:
-                row = point.split(',')
-                lat = float(row[1])
-                lon = float(row[2])
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for lat, lon in country_iseadgg_centroids(["PR", "US", "VI"], 24):  # ~= 15 miles
+            yield JsonRequest(
+                url=self.start_urls[0],
+                headers={"Accept": "application/json; v=1"},
+                data={
+                    "variables": {
+                        "input": {
+                            "lat": float(lat),
+                            "long": float(lon),
+                            "radius": 15,  # miles
+                            "locTypes": ["atm", "branch", "cafe"],
+                            "servicesFilter": [],
+                        }
+                    },
+                    "query": """query geoSearch($input: GeoSearchInput!) {
+                                    geoSearch(input: $input) {
+                                        locType
+                                        name: locationName
+                                        ref: locationId
+                                        address {
+                                            addressLine1
+                                            addressLine2
+                                            addressLine3
+                                            addressLine4
+                                            city
+                                            state: stateCode
+                                            postalCode
+                                            countryCode
+                                        }
+                                        latitude
+                                        longitude
+                                        slug
+                                        seoType
+                                        ... on Atm {
+                                            open24Hours
+                                            photo
+                                        }
+                                        ... on Branch {
+                                            phoneNumber
+                                            faxNumber
+                                            lobbyHours {
+                                                day
+                                                open
+                                                close
+                                            }
+                                            branchType
+                                            photo
+                                        }
+                                        ... on Cafe {
+                                            phoneNumber
+                                            hours {
+                                                day
+                                                open
+                                                close
+                                            }
+                                            photo
+                                        }
+                                    }
+                                }""",
+                },
+            )
 
-                raw = {"variables": {"input": {"lat": lat, "long": lon, "radius": 50,
-                                                    "locTypes": ["branch", "cafe"],
-                                                    "servicesFilter": []}},
-                            "query": "\n        query geoSearch($input: GeoSearchInput\u0021){\n          geoSearch(input: $input){\n            locType\n            locationName\n            locationId\n            address {\n              addressLine1\n              stateCode\n              postalCode\n              city\n            }\n            services\n            distance\n            latitude\n            longitude\n            slug\n            seoType\n            ... on Atm {\n              open24Hours\n            }\n            ... on Branch {\n              phoneNumber\n              timezone\n              lobbyHours {\n                day\n                open\n                close\n              }\n              driveUpHours {\n                day\n                open\n                close\n              }\n              temporaryMessage\n              reopenDate\n            }\n            ... on Cafe {\n              phoneNumber\n              photo\n              timezone\n              hours {\n                day\n                open\n                close\n              }\n              temporaryMessage\n              reopenDate\n            }\n          }\n        }"}
+    def parse(self, response: Response) -> Iterable[Feature]:
+        features = response.json()["data"]["geoSearch"]
 
-                headers = {
-                    'Accept': 'application/json;v=1',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Connection': 'keep-alive',
-                    'Content-Type': 'application/json',
-                }
+        if len(features) > 0:
+            self.crawler.stats.inc_value("atp/geo_search/hits")
+        else:
+            self.crawler.stats.inc_value("atp/geo_search/misses")
+        self.crawler.stats.max_value("atp/geo_search/max_features_returned", len(features))
 
-                yield scrapy.http.Request(
-                    BASE_URL,
-                    self.parse,
-                    method='POST',
-                    body=json.dumps(raw),
-                    headers=headers,
-                )
+        if len(features) >= 100:
+            raise RuntimeError(
+                "Locations have probably been truncated due to 100 features being returned by a single geographic radius search. Use a smaller search radius."
+            )
 
-    def parse(self, response):
-        data = json.loads(response.text)
-        location_data = data["data"]["geoSearch"]
+        for feature in features:
+            item = DictParser.parse(feature)
+            item["website"] = f'https://locations.capitalone.com/{feature["seoType"]}/{item["state"]}/{feature["slug"]}'
+            item["street_address"] = clean_address(
+                [
+                    feature["address"]["addressLine1"],
+                    feature["address"]["addressLine2"],
+                    feature["address"]["addressLine3"],
+                    feature["address"]["addressLine4"],
+                ]
+            )
+            item["image"] = feature["photo"]
 
-        if location_data:
-            for location in location_data:
-                properties = {
-                    'ref': location["locationId"],
-                    'name': location["locationName"],
-                    'addr_full': location["address"]["addressLine1"],
-                    'city': location["address"]["city"],
-                    'state': location["address"]["stateCode"],
-                    'postcode': location["address"]["postalCode"],
-                    'lat': location["latitude"],
-                    'lon': location["longitude"],
-                    'phone': location["phoneNumber"],
-                    'website': '/'.join(['https://locations.capitalone.com/bank', location["address"]["stateCode"],
-                                         location["slug"]]),
-                    'extras': {'location_type': location["locType"]}
-                }
+            if feature["locType"] == "atm":
+                apply_category(Categories.ATM, item)
+                if feature["open24Hours"] == "true":
+                    item["opening_hours"] = "24/7"
+            elif feature["locType"] == "branch":
+                apply_category(Categories.BANK, item)
+                item["opening_hours"] = self.parse_hours(feature["lobbyHours"])
+            elif feature["locType"] == "cafe":
+                apply_category(Categories.CAFE, item)
+                item["opening_hours"] = self.parse_hours(feature["hours"])
 
-                hours = location.get("hours", location.get("lobbyHours", ""))
-                if hours:
-                    store_hours = self.parse_hours(hours)
-                    properties["opening_hours"] = store_hours
-
-                yield GeojsonPointItem(**properties)
+            yield item

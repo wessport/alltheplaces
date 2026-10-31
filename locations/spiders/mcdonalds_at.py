@@ -1,146 +1,54 @@
-import json
 import re
-import scrapy
-from locations.items import GeojsonPointItem
+from typing import Any
 
-day_formats = {
-    "Mon": "Mo", 
-    "Tues": "Tu",
-    "Wed": "We",
-    "Thur": "Th",
-    "Fri": "Fr",
-    "Sat": "Sa",
-    "Sun": "Su"
-}
+from scrapy import Selector
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.hours import CLOSED_DE, DAYS_DE, OpeningHours, sanitise_day
+from locations.items import Feature
+from locations.spiders.mcdonalds import McdonaldsSpider
 
 
-class McDonaldsATSpider(scrapy.Spider):
+class McdonaldsATSpider(SitemapSpider):
     name = "mcdonalds_at"
-    item_attributes = { 'brand': "McDonald's" }
-    allowed_domains = ["www.mcdonalds.at"]
+    item_attributes = McdonaldsSpider.item_attributes
+    allowed_domains = ["mcdonalds.at"]
+    sitemap_urls = ["https://www.mcdonalds.at/wso_restaurant-sitemap.xml"]
 
-    start_urls = (
-        'http://www.mcdonalds.at/restaurant-finder',
-    )
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        item = Feature()
+        item["website"] = item["ref"] = response.url
+        item["lat"] = response.xpath("//@data-marker-icon-lat").get()
+        item["lon"] = response.xpath("//@data-marker-icon-lng").get()
+        item["addr_full"] = response.xpath('//meta[@property="og:title"]/@content').get().removesuffix(" - McDonald’s")
 
+        services = response.xpath('//*[@class="wso-tax-img"]/img/@alt').getall()
 
-    def store_hours(self, data):
-        day_groups = []
-        this_day_group = {}
-        weekdays = ['Mo', 'Th', 'We', 'Tu', 'Fr', 'Sa', 'Su']
-        
-        for index, item in enumerate(data):
-            if index == 7:
-                break
+        apply_yes_no(Extras.WIFI, item, "Wlan Icon" in services)
 
-            hours = ''
-            day_hour = item.groups()[0]
+        if "McCafe Icon" in services:
+            mccafe = item.deepcopy()
+            mccafe["ref"] = "{}-mccafe".format(item["ref"])
+            mccafe["brand"] = "McCafé"
+            mccafe["brand_wikidata"] = "Q3114287"
+            apply_category(Categories.CAFE, mccafe)
+            yield mccafe
 
-            if len(day_hour.split("-")) < 2:
-                continue
+        item["opening_hours"] = OpeningHours()
 
-            start = day_hour.split("-")[0].strip()
-            end = day_hour.split("-")[1].strip()
+        hours_selector = Selector(text=response.xpath('//div[@id="restaurants"]').get())
 
-            end_hour = end.split(":")[0]
-            end_min = end.split(":")[1]
+        for rule in hours_selector.xpath(".//p[string-length(text()) > 0]"):
+            day = rule.xpath("./span/text()").get()
+            if day := sanitise_day(day, DAYS_DE):
+                if match := re.search(r"(\d+:\d+).+?(\d+:\d+)", rule.xpath("text()[1]").get("")):
+                    item["opening_hours"].add_range(day, *match.groups(), closed=CLOSED_DE)
 
-            if int(end_hour) == 0:
-                end_hour = "23"
-                end_min = "59"
+        apply_yes_no(Extras.DELIVERY, item, "McDelivery Icon" in services)
+        apply_yes_no(Extras.DRIVE_THROUGH, item, "McDrive Icon" in services)
 
-            end = '%02d:%02d' % (
-                int(end_hour) + 12 if int(end_hour) < 12 else int(end_hour),
-                int(end_min),
-            )
-            
-            short_day = weekdays[index]
-            hours = '{}-{}'.format(start, end)
-            if not this_day_group:
-                this_day_group = {
-                    'from_day': short_day,
-                    'to_day': short_day,
-                    'hours': hours,
-                }
+        apply_category(Categories.FAST_FOOD, item)
 
-            elif hours == this_day_group['hours']:
-                this_day_group['to_day'] = short_day
-
-            elif hours != this_day_group['hours']:
-                day_groups.append(this_day_group)
-                this_day_group = {
-                    'from_day': short_day,
-                    'to_day': short_day,
-                    'hours': hours,
-                }
-            
-        day_groups.append(this_day_group)
-
-        if not day_groups:
-            return None
-
-        if bool(day_groups):
-            return None
-        opening_hours = ''
-        if len(day_groups) == 1 and day_groups[0]['hours'] in ('00:00-23:59', '00:00-00:00'):
-            opening_hours = '24/7'
-        else:
-            for day_group in day_groups:
-                if day_group['from_day'] == day_group['to_day']:
-                    opening_hours += '{from_day} {hours}; '.format(**day_group)
-                else:
-                    opening_hours += '{from_day}-{to_day} {hours}; '.format(**day_group)
-            opening_hours = opening_hours [:-2]
-
-        return opening_hours
-
-
-    def parse_city(self, data):
-        data = data.split(" ")
-        if len(data) > 1:
-            return data[0].strip(), data[1].strip()
-        else:
-            return data[0].strip(), ""
-
-    def parse_store(self, response):
-        address = response.xpath('//div[@class="street"]//text()').extract_first().strip()
-        postalCode, city = self.parse_city(response.xpath('//div[@class="postal-code-city"]//text()').extract_first())
-        phone = response.xpath('//div[@class="field--phone"]//text()').extract_first()
-        if phone:
-            phone = phone.strip()
-        else:
-            phone = ""
-
-        properties = {
-            'addr_full': address,
-            'city': city,
-            'name': "McDonald's",
-            'postcode': postalCode,
-            'phone': phone,
-            'ref': response.meta['ref'],
-            'lon': response.meta['lon'],
-            'lat': response.meta['lat']
-        }
-
-        data = re.finditer(r'<span class=\"label\">.*</span>(.*)</li>', response.body_as_unicode())
-        opening_hours = self.store_hours(data)
-        if opening_hours:
-            properties['opening_hours'] = opening_hours
-
-        yield GeojsonPointItem(**properties)
-
-
-    def parse(self, response):
-        try:
-            match = re.search(r'\"markers\":(\[.*\])', response.body_as_unicode())
-            data = json.loads(match.groups()[0])
-        except ValueError:
-            return
-
-        for item in data:
-            lat = item['latitude']
-            lon = item['longitude']
-            ref = item['rmt']
-            
-            yield scrapy.Request('http://www.mcdonalds.at/restaurant/overlay/' + ref, meta={'lat': lat, 'lon': lon, 'ref': ref}, callback=self.parse_store)
-
+        yield item

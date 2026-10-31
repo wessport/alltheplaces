@@ -1,0 +1,63 @@
+from typing import Any
+
+import chompjs
+from scrapy import Spider
+from scrapy.http import Response
+
+from locations.categories import Extras, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS, OpeningHours
+from locations.spiders.kfc_us import KFC_SHARED_ATTRIBUTES
+from locations.user_agents import FIREFOX_LATEST
+
+SERVICES_MAPPING = {
+    "click_collect": Extras.TAKEAWAY,
+    "delivery": Extras.DELIVERY,
+    "drivethru": Extras.DRIVE_THROUGH,
+    "ec_cash": None,
+    "free_refill": None,
+}
+
+
+class KfcDESpider(Spider):
+    name = "kfc_de"
+    item_attributes = KFC_SHARED_ATTRIBUTES
+    start_urls = ["https://api.kfc.de/find-a-kfc/allrestaurant"]
+    custom_settings = {"ROBOTSTXT_OBEY": False, "USER_AGENT": FIREFOX_LATEST}
+    requires_proxy = True
+
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for location in chompjs.parse_js_object(response.text):
+            if location["name"].endswith(" - COMING SOON"):
+                continue
+            location["street_address"] = location.pop("address")
+            item = DictParser.parse(location)
+            item["name"] = None
+            item["ref"] = location["id"]
+            item["website"] = "https://www.kfc.de/find-a-kfc/" + location["urlName"]
+
+            item["opening_hours"] = self.parse_opening_hours(location["operatingHoursStore"], "dinein")
+            if "delivery" in location["services"]:
+                item["extras"]["opening_hours:delivery"] = self.parse_opening_hours(
+                    location["operatingHoursStore"], "delivery"
+                ).as_opening_hours()
+            if "drivethru" in location["services"]:
+                item["extras"]["opening_hours:drive_through"] = self.parse_opening_hours(
+                    location["operatingHoursStore"], "drivethru"
+                ).as_opening_hours()
+
+            for service in location.get("services", []):
+                if tags := SERVICES_MAPPING.get(service):
+                    apply_yes_no(tags, item, True, True)
+                else:
+                    self.crawler.stats.inc_value("unknown_service/{}".format(service))
+
+            apply_yes_no(Extras.INDOOR_SEATING, item, "dinein" in location["dispositions"])
+            yield item
+
+    def parse_opening_hours(self, rules: list[dict], mode: str) -> OpeningHours:
+        oh = OpeningHours()
+        for rule in rules:
+            if rule["disposition"] == mode:
+                oh.add_range(DAYS[rule["dayOfWeek"] - 1], rule["start"], rule["end"])
+        return oh

@@ -1,0 +1,38 @@
+from typing import Any, AsyncIterator
+
+from scrapy import Spider
+from scrapy.http import FormRequest, Response
+
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+
+
+class SosBRSpider(Spider):
+    name = "sos_br"
+    item_attributes = {"brand": "SOS Tecnologia e Educação", "brand_wikidata": "Q129847471"}
+    requires_proxy = True
+
+    async def start(self) -> AsyncIterator[FormRequest]:
+        yield FormRequest(
+            url="https://www.sos.com.br/BuscaUnidadesMapa",
+            method="POST",
+            formdata={"isLead": "false", "isMapa": "true", "isTeste": "false"},
+        )
+
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for location in response.json()["Unidades"]:
+            item = Feature()
+            item["ref"] = location["ID"]
+            item["name"] = location["NomeFantasia"]
+            item["phone"] = location["Telefone"]
+            item["email"] = location["Email"]
+            item["street"] = location["Endereco"]["Logradouro"]
+            item["housenumber"] = location["Endereco"]["Numero"]
+            item["city"] = location["Endereco"]["CidadeNome"]
+            item["extras"]["addr:district"] = location["Endereco"]["Bairro"]
+            item["state"] = location["Endereco"]["EstadoNome"]
+            item["lat"] = location["Coordenadas"]["Latitude"]
+            item["lon"] = location["Coordenadas"]["Longitude"]
+            apply_category(Categories.TRAINING, item)
+
+            yield item

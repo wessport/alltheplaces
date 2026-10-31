@@ -1,44 +1,30 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from typing import AsyncIterator
 
-import scrapy
+from scrapy import Spider
+from scrapy.http import Request
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.categories import Categories, apply_category, apply_yes_no
+from locations.items import Feature
 
 
-class MarstonsPlcSpider(scrapy.Spider):
+class MarstonsPlcSpider(Spider):
     name = "marstons_plc"
-    item_attributes = {'brand': "Marstons Plc"}
-    allowed_domains = ['marstons.co.uk']
+    MARSTONS = {"brand": "Marston's", "brand_wikidata": "Q6773982"}
+    allowed_domains = ["marstonspubs.co.uk"]
+    store_types = {}
 
-    def start_requests(self):
-        url = 'https://www.marstons.co.uk/ajax/finder/markers/'
-
-        headers = {
-            'origin': 'https://www.marstons.co.uk',
-            'Referer': 'https://www.marstons.co.uk/pubs/finder/',
-            'content-type': 'application/json; charset=utf-8'
-        }
-
-        current_state = json.dumps(
-            {"s": 1, "pp": 48}
-        )
-
-        yield scrapy.Request(
-            url,
-            method='POST',
-            body=current_state,
-            headers=headers,
+    async def start(self) -> AsyncIterator[Request]:
+        yield Request(
+            url="https://www.marstonspubs.co.uk/ajax/finder/markers/",
             callback=self.parse_store_ids,
         )
 
     def parse_store_ids(self, response):
-        store_ids = json.loads(response.body_as_unicode())
+        store_ids = response.json()
         ids = []
 
         for id in store_ids["markers"]:
+            self.store_types[id["i"]] = id["t"]
             ids.append(id["i"])
 
         count = 1
@@ -50,28 +36,27 @@ class MarstonsPlcSpider(scrapy.Spider):
                 params = params + "p=" + str(i)
                 params = params + "&"
             else:
-                url = "https://www.marstons.co.uk/ajax/finder/outlet/?"
+                url = "https://www.marstonspubs.co.uk/ajax/finder/outlet/?"
                 params = params[:-1]
                 url = url + params
                 count = 0
                 params = ""
-                yield scrapy.Request(url, callback=self.parse)
-
+                yield Request(url, callback=self.parse)
             count += 1
 
-        url = "https://www.marstons.co.uk/ajax/finder/outlet/?"
+        url = "https://www.marstonspubs.co.uk/ajax/finder/outlet/?"
         params = params[:-1]
         url = url + params
-        yield scrapy.Request(url, callback=self.parse)
+        yield Request(url, callback=self.parse)
 
     def parse(self, response):
-        data = json.loads(response.body_as_unicode())
+        data = response.json()
         places = data["outlets"]
 
         for place in places:
             address = place["address"]
-            city = place["town"].split(',')
-            addr = address.split(', ')
+            city = place["town"].split(",")
+            addr = address.split(", ")
             if len(addr) == 4:
                 str_addr = addr[0]
                 state = addr[2]
@@ -90,17 +75,32 @@ class MarstonsPlcSpider(scrapy.Spider):
                 postal = addr[5]
 
             properties = {
-                'ref': place["phc"],
-                'name': place["name"],
-                'addr_full': str_addr,
-                'city': city[0],
-                'state': state,
-                'postcode': postal,
-                'country': "GB",
-                'lat': place["lat"],
-                'lon': place["lng"],
-                'phone': place["tel"],
-                'website': place["url"]
+                "ref": place["phc"],
+                "name": place["name"],
+                "addr_full": address,
+                "street_address": str_addr,
+                "city": city[0],
+                "state": state,
+                "postcode": postal,
+                "country": "GB",
+                "lat": place["lat"],
+                "lon": place["lng"],
+                "phone": place["tel"],
+                "website": place["url"],
+                "email": place["email"],
+                "brand": place["pfLabel"],
             }
 
-            yield GeojsonPointItem(**properties)
+            if properties["brand"] in ("Marston’s Carvery", "Marston’s Pub", "Marston’s Town Centre Pub", None):
+                properties.update(self.MARSTONS)
+
+            apply_category(Categories.PUB, properties)
+            apply_yes_no("payment:marstons_privilege_card", properties, place["sv"], False)
+
+            if img := place.get("img"):
+                properties["image"] = "https://www.marstonspubs.co.uk" + img
+
+            if self.store_types[place["phc"]] == 2:
+                apply_category(Categories.HOTEL, properties)
+
+            yield Feature(**properties)

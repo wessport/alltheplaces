@@ -1,74 +1,64 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-from locations.items import GeojsonPointItem
+from typing import Any, AsyncIterator, Iterable
+
+from scrapy.http import JsonRequest, Response
+
+from locations.categories import Categories, Extras, Fuel, apply_category, apply_yes_no
+from locations.items import Feature
+from locations.json_blob_spider import JSONBlobSpider
 
 
-class CenexSpider(scrapy.Spider):
+class CenexSpider(JSONBlobSpider):
     name = "cenex"
-    item_attributes = {'brand': "Cenex", 'brand_wikidata': 'Q5011381'}
-    allowed_domains = ["www.cenex.com"]
+    item_attributes = {"brand": "Cenex", "brand_wikidata": "Q62127191"}
+    locations_key = "Locations"
 
-    def start_requests(self):
-        yield scrapy.http.JsonRequest(
-            'https://www.cenex.com/Common/Services/InteractiveMap.svc/GetLocations',
-            method='POST',
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        yield JsonRequest(
+            "https://www.cenex.com/chs-sitecore/api/locationsearch/search",
+            method="POST",
             data={
-                'SearchRequest': {
-                    'Metadata': {'MapId': '', 'Categories': []},
-                    'Query': {
-                        'SearchLat': 0,
-                        'SearchLong': 0,
-                        'LocationTypes': [1, 16, 15],
-                        'Amenities': [],
-                        'Organizations': ['28e93e82-edfa-418e-90aa-7ded057a0c68'],
-                        'NELat': 90,
-                        'NELong': 180,
-                        'SWLat': -90,
-                        'SWLong': -180
-                    }
+                "Bounds": {
+                    "NorthEast": {"Latitude": 90, "Longitude": 180},
+                    "SouthWest": {"Latitude": -90, "Longitude": -180},
                 },
-                'MapItemId': '40381d43-1c05-43e0-8477-78737b9974df',
-                'AllOrganizationIds': [
-                    'b4ed9d2c-cc3b-4ce0-b642-79d75eac11fa',
-                    'cb27078e-9b6a-4f4d-ac81-eb1d163a5ff6',
-                    '68be9e56-ff49-4724-baf0-90fc833fb459',
-                    '28e93e82-edfa-418e-90aa-7ded057a0c68'
-                ],
-                'ServiceUrl': 'https://locatorservice.chsinc.ds/api/search'
-            }
+                "LocationTypes": [1, 2, 4, 8],
+                "Amenities": [],
+            },
         )
 
-    def parse(self, response):
-        result = json.loads(response.body_as_unicode())
+    def post_process_item(self, item: Feature, response: Response, feature: dict, **kwargs: Any) -> Iterable[Feature]:
+        types = feature["Types"].split("|")
+        if "GasStation" not in types and "PremiumDiesel" not in types:
+            return  # Bulk lubricant/propane co-op dealers, not fuel stations
 
-        for store in result['SearchResponse']['Locations']:
-            amenities = '|'.join([a['Name'] for a in store['Amenities']])
+        item["operator"] = item.pop("name")
+        item["country"] = "US"
 
-            yield GeojsonPointItem(
-                lon=store['Long'],
-                lat=store['Lat'],
-                ref=store['LocationId'],
-                name=store['Name'],
-                addr_full=' '.join(
-                    [store['Address1'], store['Address2']]).strip(),
-                city=store['City'],
-                state=store['State'],
-                postcode=store['Zip'],
-                country='US',
-                phone=store['Phone'],
-                website=store['WebsiteUrl'],
-                opening_hours='24/7' if '24-Hour' in amenities else None,
-                extras={
-                    'amenity:fuel': True,
-                    'atm': 'ATM' in amenities,
-                    'car_wash': 'Car Wash' in amenities,
-                    'fuel:biodiesel': 'Biodiesel' in amenities or None,
-                    'fuel:diesel': 'Diesel' in amenities or None,
-                    'fuel:e85': 'Flex Fuels' in amenities or None,
-                    'fuel:HGV_diesel': 'Truck Stop' in amenities or None,
-                    'fuel:propane': 'Propane' in amenities or None,
-                    'hgv': 'Truck Stop' in amenities or None,
-                    'shop': 'convenience' if 'Convenience Store' in amenities else None,
-                }
-            )
+        amenities = [a["Name"] for a in feature["Amenities"]]
+
+        apply_category(Categories.FUEL_STATION, item)
+        apply_yes_no(Extras.ATM, item, "ATM" in amenities)
+        apply_yes_no(Extras.COMPRESSED_AIR, item, "Free Air" in amenities)
+        apply_yes_no(Extras.CAR_WASH, item, "Car Wash" in amenities)
+        apply_yes_no(Fuel.DIESEL, item, "Diesel Fuel" in amenities or "PremiumDiesel" in types)
+        apply_yes_no(Fuel.HGV_DIESEL, item, "PremiumDiesel" in types)
+        apply_yes_no(Fuel.ETHANOL_FREE, item, "Ethanol-free Gas" in amenities)
+        apply_yes_no(Fuel.PROPANE, item, "Propane" in amenities)
+        apply_yes_no(
+            "food=yes",
+            item,
+            any(
+                a in amenities
+                for a in [
+                    "Beer",
+                    "Chicken Restaurant",
+                    "Coffee Shop",
+                    "Donuts",
+                    "Fast Food Restaurant",
+                    "Pizza Takeaway",
+                    "Sandwich Shop",
+                ]
+            ),
+        )
+
+        yield item

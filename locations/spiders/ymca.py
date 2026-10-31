@@ -1,144 +1,77 @@
-# -*- coding: utf-8 -*-
-from datetime import datetime
-import json
 import re
-from urllib.parse import urlencode
 
-import scrapy
+from scrapy.spiders import SitemapSpider
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
-
-SINGLE_POINT_STATES = [
-    ("0,64.0685,-152.2782,AK"),
-    ("1,20.6538883744,-157.8631750471,HI"),
-]
-
-HUNDRED_MILES_STATES = {"MT", "WY", "SD", "ND", "NE", "NV", "AZ", "NM", "UT", "ID"}
-TWENTYFIVE_MILES_STATES = {"MD", "OH", "FL", "IL", "IA", "WI", "MN", "RI", "MA", "NH",
-                           "SC", "NC", "NJ", "WA", "CA", "PA", "NY"}
-ADDITONAL_CITIES = [
-    "Los Angeles, CA",
-    "New York, NY",
-    "Boston, MA",
-    "Philadelphia, PA",
-    "Dallas, TX",
-    "Houston, TX",
-    "Seattle, WA",
-    "San Francisco, CA",
-    "Denver, CO",
-    "Minneapolis, MN",
-    "Omaha, NE",
-    "St. Louis, MO",
-    "Chicago, IL",
-    "Montgomery, AL",
-    "Orlando, FL",
-    "St. Petersburg, FL",
-    "Atlanta, GA",
-    "Poughkeepsie, NY",
-    "Hartford, CT",
-    "Concord, NH"
-]
+from locations.hours import DAYS_3_LETTERS, OpeningHours
+from locations.items import Feature
 
 
-class YmcaSpider(scrapy.Spider):
+class YmcaSpider(SitemapSpider):
     name = "ymca"
-    item_attributes = { 'brand': "YMCA" }
-    allowed_domains = ["ymca.net"]
-    download_delay = 0.5
+    item_attributes = {"brand": "YMCA", "brand_wikidata": "Q157169"}
+    allowed_domains = ["ymca.org"]
+    sitemap_urls = [
+        "https://www.ymca.org/sitemap.xml",
+    ]
+    sitemap_rules = [(r"locations/", "parse_location")]
 
-    def start_requests(self):
-        url = 'https://www.ymca.net/find-your-y/?'
+    def sitemap_filter(self, entries):
+        for entry in entries:
+            # To avoid constant redirects
+            entry["loc"] = entry["loc"].replace("https://ymca.org/", "https://www.ymca.org/")
+            yield entry
 
-        for point in SINGLE_POINT_STATES:
-            _, lat, lon, state = point.strip().split(',')
-            params = {"address": "{},{}".format(lat, lon)}
-            yield scrapy.Request(url=url + urlencode(params))
+    def parse_location(self, response):
+        geo = response.xpath('//div[contains(@class, "geolocation-location")]')
 
-        with open('./locations/searchable_points/us_centroids_100mile_radius_state.csv') as points:
-            next(points)
-            for point in points:
-                _, lat, lon, state = point.strip().split(',')
-                if state in HUNDRED_MILES_STATES:
-                    params = {"address": "{},{}".format(lat, lon)}
-                    yield scrapy.Request(url=url + urlencode(params))
-
-        with open('./locations/searchable_points/us_centroids_25mile_radius_state.csv') as points:
-            next(points)
-            for point in points:
-                _, lat, lon, state = point.strip().split(',')
-                if state in TWENTYFIVE_MILES_STATES:
-                    params = {"address": "{},{}".format(lat, lon)}
-                    yield scrapy.Request(url=url + urlencode(params))
-
-        with open('./locations/searchable_points/us_centroids_50mile_radius_state.csv') as points:
-            next(points)
-            for point in points:
-                _, lat, lon, state = point.strip().split(',')
-                if state not in HUNDRED_MILES_STATES.union(TWENTYFIVE_MILES_STATES).union({"AK", "HI"}):
-                    params = {"address": "{},{}".format(lat, lon)}
-                    yield scrapy.Request(url=url + urlencode(params))
-
-        for city in ADDITONAL_CITIES:
-            params = {"address": city}
-            yield scrapy.Request(url=url + urlencode(params))
+        yield Feature(
+            ref=response.url.split("/")[-1],
+            name=response.xpath("//h1/text()").extract_first().strip(),
+            lat=float(geo.attrib["data-lat"]),
+            lon=float(geo.attrib["data-lng"]),
+            street_address=response.xpath('//span[@class="address-line1"]/text()').extract_first(),
+            city=response.xpath('//span[@class="locality"]/text()').extract_first(),
+            state=response.xpath('//span[@class="administrative-area"]/text()').extract_first(),
+            postcode=response.xpath('//span[@class="postal-code"]/text()').extract_first(),
+            country=response.xpath('//span[@class="country"]/text()').extract_first(),
+            phone=response.xpath('//div[contains(@class, "field--type-telephone")]//a/text()').extract_first(),
+            website=response.url,
+            opening_hours=self.parse_hours(
+                response.xpath('//div[contains(@class, "field--name-field-branch-hours")]//td/text()').getall()
+            ),
+        )
 
     def parse_hours(self, hours):
         opening_hours = OpeningHours()
 
-        for hour in hours:
-            hour = hour.strip()
-            if hour == "Hours of Operation:":
+        days = hours[0::2]
+        times = hours[1::2]
+
+        for day_range, time_range in zip(days, times):
+            if time_range == "Closed":
                 continue
 
-            try:
-                day, open_time, close_time = re.search(r'(.*?):\s(.*?)\s-\s(.*?)$', hour).groups()
-            except AttributeError:  # closed
-                continue
-            open_time = open_time.replace('.', '')
-            close_time = close_time.replace('.', '')
+            open_time, close_time = re.sub(r"\s", "", time_range).split("-")
 
-            open_time = (datetime.strptime(open_time, '%I:%M %p')
-                         if ":" in open_time
-                         else datetime.strptime(open_time, '%I %p')).strftime('%H:%M')
-            close_time = (datetime.strptime(close_time, '%I:%M %p')
-                          if ":" in close_time
-                          else datetime.strptime(close_time, '%I %p')).strftime('%H:%M')
+            # Day range, e.g. Mon - Fri
+            if "-" in day_range:
+                start_day, end_day = re.sub(r"[\s:]", "", day_range).split("-")
+                for day in DAYS_3_LETTERS[
+                    DAYS_3_LETTERS.index(start_day[0:3]) : DAYS_3_LETTERS.index(end_day[0:3]) + 1
+                ]:
+                    opening_hours.add_range(
+                        day=day[0:2],
+                        open_time=open_time,
+                        close_time=close_time,
+                        time_format="%I:%M%p",
+                    )
+            # Single day, e.g. Sat
+            else:
+                opening_hours.add_range(
+                    day=day_range[0:2],
+                    open_time=open_time,
+                    close_time=close_time,
+                    time_format="%I:%M%p",
+                )
 
-            opening_hours.add_range(day=day[:2],
-                                    open_time=open_time,
-                                    close_time=close_time,
-                                    time_format='%H:%M')
-        return opening_hours.as_opening_hours()
-
-    def parse_location(self, response):
-        p = response.xpath('//main//p[1]/text()').extract()
-        p = [x.strip() for x in p if x.strip()]
-
-        phone = p.pop(-1)  # last line is phone number
-        city, state, postcode = re.search(r'(.*?), ([A-Z]{2}) ([\d-]+)$', p.pop(-1)).groups()  # next to last line is city/state/zip
-        address = " ".join(p)  # every thing left is street address
-
-        properties = {
-            'ref': re.search(r'.+/?id=(.+)', response.url).group(1),
-            'name': response.xpath('//main//h1/text()').extract_first(),
-            'addr_full': address,
-            'city': city,
-            'state': state,
-            'postcode': postcode,
-            'country': 'US',
-            'lat': float(response.xpath('//div[@id="y-profile-position"]/@data-latitude').extract_first()),
-            'lon': float(response.xpath('//div[@id="y-profile-position"]/@data-longitude').extract_first()),
-            'phone': phone.replace("Phone: ", ""),
-            'website': response.xpath('//div[@id="y-profile-position"]/@data-url').extract_first()
-        }
-        
-        properties['opening_hours'] = self.parse_hours(response.xpath('//main//p[contains(text(), "Hours")]/text()').extract())
-        
-        yield GeojsonPointItem(**properties)
-
-    def parse(self, response):
-        urls = response.xpath('//main//ul[not(contains(@class, "ymca-pagination"))]/li/h3//a/@href').extract()
-
-        for url in urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_location)
+        return opening_hours

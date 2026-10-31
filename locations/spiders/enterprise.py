@@ -1,41 +1,35 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
+from typing import AsyncIterator
 
-from locations.items import GeojsonPointItem
+import geonamescache
+from scrapy import Spider
+from scrapy.http import JsonRequest
 
-class EnterpriseSpider(scrapy.Spider):
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.pipelines.address_clean_up import clean_address
+
+
+class EnterpriseSpider(Spider):
     name = "enterprise"
-    item_attributes = {'brand': "Enterprise Rent-A-Car", 'brand_wikidata': "Q17085454"}
-    allowed_domains = ["www.enterprise.com"]
-    start_urls = (
-        'https://www.enterprise.com/en/car-rental/locations.html',
-    )
+    item_attributes = {"brand": "Enterprise", "brand_wikidata": "Q17085454"}
+    allowed_domains = ["prd.location.enterprise.com"]
+
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        gc = geonamescache.GeonamesCache()
+        countries = gc.get_countries()
+        for country_code in countries.keys():
+            yield JsonRequest(
+                url=f"https://prd.location.enterprise.com/enterprise-sls/search/location/enterprise/web/country/{country_code}"
+            )
 
     def parse(self, response):
-        for u in response.xpath('//div[@class="cf"]/ul/li/a/@href').extract():
-            if u.startswith('/en/car-rental/locations'):
-                country = u.rsplit('/', 1)[1].rsplit('.', 1)[0]
-                yield scrapy.Request(
-                    'https://www.enterprise.com/en/car-rental/locations/%s/_jcr_content.mapdata.js' % country,
-                    callback=self.parse_country,
-                )
-
-    def parse_country(self, response):
-        data = json.loads(response.body_as_unicode())
-        if data:
-            for d in data:
-                properties = {
-                    'name': d.get('name'),
-                    'phone': d.get('formatted_phone'),
-                    'website': d.get('url'),
-                    'addr_full': ' '.join(d.get('address_lines') or []),
-                    'city': d.get('city'),
-                    'state': d.get('state'),
-                    'postcode': d.get('postal_code'),
-                    'country': d.get('country_code'),
-                    'lat': d.get('latitude'),
-                    'lon': d.get('longitude'),
-                    'ref': d.get('station_id'),
-                }
-                yield GeojsonPointItem(**properties)
+        for location in response.json():
+            if location["closed"] or not location["physicalLocation"]:
+                continue
+            item = DictParser.parse(location)
+            item["ref"] = location["stationId"]
+            item["branch"] = location["locationNameTranslation"]
+            item["street_address"] = clean_address(location["addressLines"])
+            item["phone"] = location["formattedPhone"]
+            apply_category(Categories.CAR_RENTAL, item)
+            yield item

@@ -1,88 +1,70 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-import re
+from typing import Any, AsyncIterator
 
-from locations.items import GeojsonPointItem
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
 
-WIKIBRANDS = {
-    'Circle K': 'Q3268010',
-    'Corner Store': 'Q16959310',
-    'Couche-Tard': 'Q2836957',
-    'Flash Foods': 'Q16959310',
-    'Kangaroo Express': 'Q61747408',
-    "Mac's": 'Q4043527',
-    'On The Run': 'Q16931259'
-}
+from locations.categories import Categories, Extras, Fuel, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS_FULL, OpeningHours
+from locations.pipelines.address_clean_up import merge_address_lines
 
 
-class CircleKSpider(scrapy.Spider):
-
+class CircleKSpider(Spider):
     name = "circle_k"
-    item_attributes = {'brand': "Circle K", 'brand_wikidata': "Q3268010"}
-    allowed_domains = ["www.circlek.com"]
+    CIRCLE_K = {"brand": "Circle K", "brand_wikidata": "Q3268010"}
 
-    start_urls = (
-        'https://www.circlek.com/stores_new.php?lat=30.352998399999997&lng=-97.79609599999999&distance=80000&services=&region=global',
-    )
+    brands = {
+        "CIRCLEK": (CIRCLE_K, Categories.SHOP_CONVENIENCE),
+        "COUCHE_TARD": ({"brand": "Couche-Tard", "brand_wikidata": "Q2836957"}, Categories.SHOP_CONVENIENCE),
+        "HOLIDAY": ({"brand": "Holiday", "brand_wikidata": "Q5880490"}, Categories.SHOP_CONVENIENCE),
+    }
 
-    def parse(self, response):
-        results = json.loads(response.body_as_unicode())
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for country in ["US", "CA"]:
+            for lat_lon in [
+                (-125.0, 49.0, -115.0, 42.0),
+                (-115.0, 49.0, -105.0, 42.0),
+                (-105.0, 49.0, -95.0, 42.0),
+                (-95.0, 49.0, -85.0, 42.0),
+                (-85.0, 49.0, -75.0, 42.0),
+                (-125.0, 42.0, -115.0, 35.0),
+                (-115.0, 42.0, -105.0, 35.0),
+                (-105.0, 42.0, -95.0, 35.0),
+                (-95.0, 42.0, -85.0, 35.0),
+                (-180.0, 90.0, 180.0, -90.0),
+            ]:
+                yield JsonRequest(
+                    url=f"https://api.circlek.com/us/ngrp-store-locator/v1/stations?bottomRightLongitude={lat_lon[2]}&bottomRightLatitude={lat_lon[3]}&topLeftLongitude={lat_lon[0]}&topLeftLatitude={lat_lon[1]}&maxResults=2000&country={country}&brand=CIRCLEK,COUCHE_TARD,HOLIDAY",
+                )
 
-        for storeid, store in results['stores'].items():
-            services = store['services']
-
-            properties = {
-                'ref': store['cost_center'],
-                'name': store['display_brand'],
-                'addr_full': store['address'],
-                'city': store['city'],
-                'country': store['country'],
-                'lat': re.sub(r"[^\d\-\.]", "", store['latitude']),
-                'lon': re.sub(r"[^\d\-\.]", "", store['longitude']),
-                'website': f"https://www.circlek.com{store['url']}" if store['url'] else None,
-                'brand': store['display_brand'],
-                'brand_wikidata': WIKIBRANDS.get(store['display_brand'], WIKIBRANDS['Circle K']),
-                'extras': {
-                    'amenity:fuel': any('gas' == s['name'] for s in services) or None,
-                    'fuel:diesel': any('diesel' == s['name'] for s in services) or None,
-                    'car_wash': any('car_wash' == s['name'] for s in services) or None,
-                    'shop': 'convenience'
-                }
-            }
-
-            yield scrapy.Request(url=response.urljoin(store['url']),
-                                 callback=self.parse_state,
-                                 meta={'properties': properties})
-
-    def parse_state(self, response):
-        properties = response.meta['properties']
-        # Not all countries/store pages follow the same format
-        if properties['country'] == 'US':
-            state = response.xpath(
-                '//*[@class="heading-small"]/span[2]/text()').extract_first()
-            postal = response.xpath(
-                '//*[@class="heading-small"]/span[3]/text()').extract_first()
-        elif properties['country'] in ['CA', 'Canada']:
-            extracted = response.xpath(
-                '//*[@class="heading-small"]/span[2]/text()').extract_first()
-            if extracted and len(extracted) < 4:
-                state = response.xpath(
-                    '//*[@class="heading-small"]/span[2]/text()').extract_first()
-                postal = response.xpath(
-                    '//*[@class="heading-small"]/span[3]/text()').extract_first()
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for location in response.json():
+            item = DictParser.parse(location)
+            item["street_address"] = item.pop("street")
+            item["addr_full"] = merge_address_lines(location["address"].values())
+            if location["openingHours"].get("alwaysOpen"):
+                item["opening_hours"] = "24/7"
             else:
-                state = ""
-                postal = response.xpath(
-                    '//*[@class="heading-small"]/span[2]/text()').extract_first()
-        else:
-            state = ""
-            postal = response.xpath(
-                '//*[@class="heading-small"]/span[2]/text()').extract_first()
-
-        properties.update({
-            'state': state,
-            'postcode': postal,
-        })
-
-        yield GeojsonPointItem(**properties)
+                item["opening_hours"] = OpeningHours()
+                for day in DAYS_FULL:
+                    if rule := location["openingHours"].get(day.lower()):
+                        item["opening_hours"].add_range(day, rule["open"], rule["close"])
+            services = [service["displayName"] for service in location["services"]]
+            fuels = [fuels["displayName"] for fuels in location["fuels"]]
+            apply_yes_no(Extras.ATM, item, "ATM" in services)
+            apply_yes_no(Extras.TOILETS, item, "Public Restrooms" in services)
+            apply_yes_no(Extras.CAR_WASH, item, "Car wash" in services)
+            apply_yes_no(Fuel.ELECTRIC, item, "EV Charging" in services)
+            apply_yes_no(Fuel.DIESEL, item, "Diesel" in fuels)
+            apply_yes_no(Fuel.GASOLINE, item, "Gas" in fuels)
+            brand, cat = self.brands.get(location["brand"], (None, None))
+            if brand:
+                item.update(brand)
+                apply_category(cat, item)
+                item["name"] = brand.get("brand")
+            else:
+                if "Gas" in fuels or "Diesel" in fuels:
+                    apply_category(Categories.FUEL_STATION, item)
+                else:
+                    apply_category(Categories.SHOP_CONVENIENCE, item)
+            yield item

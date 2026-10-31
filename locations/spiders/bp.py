@@ -1,90 +1,113 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
+from typing import Iterable
 
-from locations.items import GeojsonPointItem
-
-BRANDS = {
-    'BP': 'BP',
-    'AM': 'Amoco',
-    'ARAL Tankstelle': 'Aral'
-}
-
-WIKIBRANDS = {
-    'BP': 'Q152057',
-    'AM': 'Q465952',
-    'ARAL Tankstelle': 'Q565734'
-}
+from locations.categories import (
+    Access,
+    Categories,
+    Extras,
+    Fuel,
+    FuelCards,
+    PaymentMethods,
+    apply_category,
+    apply_yes_no,
+)
+from locations.items import Feature
+from locations.storefinders.geo_me import GeoMeSpider
 
 
-class BPSpider(scrapy.Spider):
+class BpSpider(GeoMeSpider):
     name = "bp"
-    item_attributes = {'brand': "BP", 'brand_wikidata': "Q152057"}
-    allowed_domains = ["bpretaillocator.geoapp.me"]
-    download_delay = 0.2
-    start_urls = [
-        "https://bpretaillocator.geoapp.me/api/v1/locations/within_bounds?sw%5B%5D=-90&sw%5B%5D=-180&ne%5B%5D=90&ne%5B%5D=180"
-    ]
+    api_key = "bpretaillocator"
+    brands = {
+        "bp": {"brand": "BP", "brand_wikidata": "Q152057"},
+        "aral": {"brand": "Aral", "brand_wikidata": "Q565734"},
+        "amoco": {"brand": "Amoco", "brand_wikidata": "Q465952"},
+        "aral_pulse": {"brand": "Aral pulse", "operator": "Aral", "operator_wikidata": "Q565734"},
+        "esso": {"brand": "Esso", "brand_wikidata": "Q867662"},
+        "petro": {"brand": "Petro", "brand_wikidata": "Q64051305"},
+        "ta": {"brand": "TA", "brand_wikidata": "Q7835892"},
+        "ta_express": {"brand": "TA Express", "brand_wikidata": "Q7835892"},
+        "thorntons": {"brand": "Thorntons", "brand_wikidata": "Q7796584"},
+    }
 
-    def parse(self, response):
-        for result in json.loads(response.body_as_unicode()):
-            # This within_bounds endpoint always returns an array with one of
-            # two kinds of response.
-            #
-            # 1. An array of smaller bounding boxes with counts
-            # 2. An array of station listings
-            if 'bounds' in result:
-                b = result['bounds']
+    def parse_item(self, item: Feature, location: dict) -> Iterable[Feature]:
+        if location.get("name", "").upper().startswith("ESSO"):
+            item.update(self.brands["esso"])
+        elif brand := self.brands.get(location["site_brand"]):
+            item.update(brand)
+        else:
+            item.update(self.brands["bp"])
+            self.crawler.stats.inc_value("{}/unmapped_brand/{}".format(self.name, location["site_brand"]))
 
-                yield scrapy.Request(
-                    f"https://bpretaillocator.geoapp.me/api/v1/locations/within_bounds?sw%5B%5D={b['sw'][0]}&sw%5B%5D={b['sw'][1]}&ne%5B%5D={b['ne'][0]}&ne%5B%5D={b['ne'][1]}"
-                )
-            if 'name' in result:
-                products = result['products']
-                facilities = result['facilities']
+        products = location["products"]
+        facilities = location["facilities"]
 
-                yield GeojsonPointItem(
-                    lat=result['lat'],
-                    lon=result['lng'],
-                    name=result['name'],
-                    addr_full=result['address'],
-                    city=result['city'],
-                    state=result['state'],
-                    postcode=result['postcode'],
-                    country=result['country_code'],
-                    opening_hours='24/7' if 'open_24_hours' in facilities else '',
-                    phone=result['telephone'],
-                    website=result['website'],
-                    ref=result['id'],
-                    brand=BRANDS.get(result['site_brand'], BRANDS['BP']),
-                    brand_wikidata=WIKIBRANDS.get(
-                        result['site_brand'], WIKIBRANDS['BP']),
-                    extras={
-                        'amenity:chargingstation': 'electricity' in products,
-                        'amenity:fuel': True,
-                        'amenity:toilets': 'toilet' in facilities,
-                        'atm': 'cash_point' in facilities,
-                        'car_wash': 'car_wash' in facilities,
-                        'fuel:adblue': any('ad_blue' in p for p in products) or None,
-                        'fuel:diesel': any('diesel' in p for p in products) or None,
-                        'fuel:disel:class2': 'diesel_frost' in products or None,
-                        'fuel:e10': 'e10' in products or None,
-                        'fuel:e5': 'euro_95' in products or 'super_e5' in products or None,
-                        'fuel:GTL_diesel': any('ultimate_diesel' in p for p in products) or None,
-                        'fuel:HGV_diesel': 'truck_diesel' in products or None,
-                        'fuel:lpg': 'lpg' in products or None,
-                        'fuel:octane_100': any('100' in p for p in products) or None,
-                        'fuel:octane_102': any('102' in p for p in products) or None,
-                        'fuel:octane_91': any('premium_unlead' in p for p in products) or None,
-                        'fuel:octane_92': any('92' in p for p in products) or None,
-                        'fuel:octane_93': any('93' in p for p in products) or None,
-                        'fuel:octane_95': 'unlead' in products or any('unleaded_95' in p for p in products) or None,
-                        'fuel:octane_98': 'ultimate_unleaded' in products or any('98' in p for p in products) or None,
-                        'fuel:untaxed_diesel': 'red_diesel' in products or None,
-                        'hgv': any('truck' in f for f in facilities),
-                        'shop': 'convenience' if 'shop' in facilities else '',
-                        'wheelchair': 'disabled_facilities' in facilities,
-                        'facilities': facilities,
-                        'products': products
-                    }
-                )
+        yield from self.parse_stores(item, location) or []
+
+        if location["site_brand"] == "aral_pulse":
+            item["located_in"] = item.pop("name")
+            apply_category(Categories.CHARGING_STATION, item)
+        else:
+            apply_category(Categories.FUEL_STATION, item)
+
+        if "restaurant" in facilities:
+            apply_yes_no("food", item, True)
+
+        if "electric_charging" in facilities or "electricity" in products:
+            apply_yes_no(Fuel.ELECTRIC, item, True)
+
+        apply_yes_no(Extras.TOILETS, item, any("toilet" in a for a in facilities))
+        apply_yes_no(Extras.SHOWERS, item, "shower" in facilities)
+        apply_yes_no(Extras.ATM, item, "cash_point" in facilities)
+        apply_yes_no(
+            Extras.CAR_WASH,
+            item,
+            "car_wash" in facilities or "car_wash_self_service" in facilities or "super_wash" in facilities,
+        )
+        apply_yes_no(Extras.VACUUM_CLEANER, item, "vacuum_cleaner" in facilities)
+        apply_yes_no(Extras.WIFI, item, "wifi" in facilities)
+        apply_yes_no(Access.HGV, item, any("truck" in f for f in facilities))
+        apply_yes_no(Extras.WHEELCHAIR, item, "disabled_facilities" in facilities)
+        apply_yes_no(Fuel.ADBLUE, item, any("ad_blue" in p for p in products))
+        apply_yes_no(Fuel.DIESEL, item, any("diesel" in p for p in products))
+        apply_yes_no(Fuel.COLD_WEATHER_DIESEL, item, "diesel_frost" in products)
+        apply_yes_no(Fuel.E10, item, "e10" in products)
+        apply_yes_no(Fuel.E5, item, "euro_95" in products or "super_e5" in products)
+        apply_yes_no(Fuel.GTL_DIESEL, item, any("ultimate_diesel" in p for p in products))
+        apply_yes_no(Fuel.HGV_DIESEL, item, "truck_diesel" in products)
+        apply_yes_no(Fuel.LPG, item, "lpg" in products)
+        apply_yes_no(Fuel.OCTANE_100, item, any("100" in p for p in products))
+        apply_yes_no(Fuel.OCTANE_91, item, any("premium_unlead" in p for p in products))
+        apply_yes_no(Fuel.OCTANE_92, item, any("92" in p for p in products))
+        apply_yes_no(Fuel.OCTANE_93, item, any("93" in p for p in products))
+        apply_yes_no(Fuel.OCTANE_95, item, "unlead" in products or any("unleaded_95" in p for p in products))
+        apply_yes_no(Fuel.OCTANE_98, item, "ultimate_unleaded" in products or any("98" in p for p in products))
+        apply_yes_no(Fuel.UNTAXED_DIESEL, item, "red_diesel" in products)
+        apply_yes_no(PaymentMethods.VISA, item, "visa" in facilities)
+        apply_yes_no(PaymentMethods.MASTER_CARD, item, "mastercard" in facilities)
+        apply_yes_no(FuelCards.BP, item, "bp_fuel_card" in facilities or "euroshell_card" in facilities)
+        apply_yes_no(FuelCards.DKV, item, "dkv" in facilities)
+        apply_yes_no(FuelCards.UTA, item, "uta" in facilities)
+        yield item
+
+    store_brands = {
+        "bp_connect_store": {"name": "BP Connect", "brand": "BP Connect", "brand_wikidata": "Q152057"},
+        "aral_store": {"name": "Aral", "brand": "Aral", "brand_wikidata": "Q565734"},
+        "rewe_to_go": {"name": "REWE To Go", "brand": "REWE To Go", "brand_wikidata": "Q85224313"},
+        "wild_bean_cafe": {"name": "Wild Bean Cafe", "brand": "Wild Bean Cafe", "brand_wikidata": "Q61804826"},
+    }
+
+    def parse_stores(self, item: Feature, location: dict) -> Iterable[Feature]:
+        for store_key in self.store_brands.keys():
+            if store_key not in location["facilities"]:
+                continue
+            store = item.deepcopy()
+            store["ref"] = "{}-{}".format(item.get("ref"), store_key)
+            store.update(self.store_brands[store_key])
+
+            store["opening_hours"] = "24/7" if "shop_open_24_hours" in location["facilities"] else None
+
+            if store_key == "wild_bean_cafe":
+                apply_category(Categories.CAFE, store)
+            else:
+                apply_category(Categories.SHOP_CONVENIENCE, store)
+            yield store

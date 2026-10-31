@@ -1,65 +1,38 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import re
-import json
+from typing import AsyncIterator, Iterable
 
-from locations.items import GeojsonPointItem
+from scrapy.http import JsonRequest
+
+from locations.geo import point_locations
+from locations.items import Feature
+from locations.storefinders.rio_seo import RioSeoSpider
 
 
-class PandoraSpider(scrapy.Spider):
+class PandoraSpider(RioSeoSpider):
     name = "pandora"
-    item_attributes = { 'brand': "Pandora" }
-    allowed_domains = ['pandora.net']
-    start_urls = (
-        'https://stores.pandora.net/en-us/',
-    )
+    item_attributes = {"brand": "Pandora", "brand_wikidata": "Q2241604"}
+    end_point = "https://maps.pandora.net"
+    radius = 346
 
-    def parse(self, response):
-        response.selector.remove_namespaces()
-        city_urls = response.xpath('//div[@class="map-list-item is-single"]/a/@href').extract()
-        for path in city_urls:
-            yield scrapy.Request(
-                response.request.url + path.strip(),
-                callback=self.parse_state,
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for lat, lng in point_locations("earth_centroids_iseadgg_346km_radius.csv"):
+            yield JsonRequest(
+                f"{self.end_point}/api/getAsyncLocations?template={self.template}&level={self.template}&radius={self.radius}&limit={self.limit}&lat={lat}&lng={lng}",
+                callback=self.parse,
             )
 
-    def parse_state(self, response):
-        response.selector.remove_namespaces()
-        location_urls = response.xpath('//div[@class="map-list-item is-single"]/a[@class="gaq-link"]/@href').extract()
-        for path in location_urls:
-            yield scrapy.Request(
-                response.request.url + path.strip(),
-                callback=self.parse_city,
-            )
-
-    def parse_city(self, response):
-        response.selector.remove_namespaces()
-        location_urls = response.xpath('//a[@class="js-view-store-details gaq-link"]/@href').extract()
-        for path in location_urls:
-            yield scrapy.Request(
-                "https:" + path.strip(),
-                callback=self.parse_store,
-            )
-
-
-    def parse_store(self, response):
-        json_data = response.xpath('//script[@type="application/ld+json"]/text()').extract_first().replace('"Chic"', 'Chic')
-        data = json.loads(json_data)
-        data = data[0]
-
-        properties = {
-        'name': data['name'],
-        'ref': data['name'],
-        'addr_full': data['address']['streetAddress'],
-        'city': data['address']['addressLocality'],
-        'state': data['address']['addressRegion'],
-        'postcode': data['address']['postalCode'],
-        'phone': data['address']['telephone'],
-        'website': data['url'],
-        'opening_hours': data['openingHours'],
-        'lat': float(data['geo']['latitude']),
-        'lon': float(data['geo']['longitude']),
-        }
-
-
-        yield GeojsonPointItem(**properties)
+    def post_process_feature(self, feature: Feature, location: dict) -> Iterable[Feature]:
+        if location.get("Store Type_CS") == "Authorized Retailers":
+            return
+        feature["phone"] = location.get("location_phone") or location.get("local_phone")
+        postcode = location.get("location_post_code") or location.get("post_code")
+        if postcode and not postcode.replace("0", "").strip():
+            postcode = None  # Placeholder like "0000" or "00000"
+        feature["postcode"] = postcode
+        feature["country"] = feature["ref"][:2].upper()
+        if indy_url := location.get("indy_url"):
+            if indy_url.startswith("//"):
+                indy_url = "https:" + indy_url
+            if indy_url.startswith("http"):
+                feature["website"] = indy_url
+        feature["branch"] = feature.pop("name").removeprefix("Pandora ").removeprefix("Store ").removeprefix("@ ")
+        yield feature

@@ -1,40 +1,29 @@
-import scrapy
 import re
-import json
-from locations.items import GeojsonPointItem
-class ArgosSpider(scrapy.Spider):
+from typing import Iterable
 
+from locations.items import Feature
+from locations.spiders.sainsburys import SainsburysSpider
+from locations.spiders.tesco_gb import set_located_in
+from locations.storefinders.yext_answers import YextAnswersSpider
+
+
+class ArgosSpider(YextAnswersSpider):
     name = "argos"
-    item_attributes = { 'brand': "Argos" }
-    allowed_domains = ["www.argos.co.uk"]
-    download_delay = 0.5
-    start_urls = (
-        'http://www.argos.co.uk/stores/',
-    )
-    def parse_stores(self, response):
-        data = re.findall(r"window.INITIAL_STATE =[^<]+", response.body_as_unicode())
-        json_data = json.loads(data[0].replace("window.INITIAL_STATE =" ,''))
-        properties = {
-            'addr_full':json_data['store']['store']["address"],
-            'phone': json_data['store']['store']["tel"],
-            'city':json_data['store']['store']["town"],
-            'state': '',
-            'postcode': json_data['store']['store']["postcode"],
-            'ref': json_data['store']['store']["id"],
-            'website': response.url,
-            'lat': float(json_data['store']['store']["lat"]),
-            'lon': float(json_data['store']['store']["lng"]),
-        }
+    item_attributes = {"brand": "Argos", "brand_wikidata": "Q4789707"}
+    endpoint = "https://prod-cdn.us.yextapis.com/v2/accounts/me/search/vertical/query"
+    experience_key = "argos-locator"
+    api_key = "5295de161feec2b9e1ca6f483e9f77dd"
+    locale = "en-GB"
 
-        open_hours = ''
-        for item in json_data['store']['store']["storeTimes"]:
-          open_hours = open_hours + item['date'][ :2]+ ' ' + item['time']+' ;'
-        if open_hours:
-            properties['opening_hours'] = open_hours
-
-        yield GeojsonPointItem(**properties)
-
-    def parse(self, response):
-        urls = response.xpath('//div/div[@class="azsl-panel"]/ul/li/a/@href').extract()
-        for path in urls:
-            yield scrapy.Request(response.urljoin(path), callback=self.parse_stores)
+    def parse_item(self, location: dict, item: Feature) -> Iterable[Feature]:
+        if "Collection Point" in item["name"]:
+            return
+        if m := re.search(r"((?:in|inside|) Sainsbury'?s?)", item["name"], flags=re.IGNORECASE):
+            item["name"] = item["name"].replace(m.group(1), "").replace("()", "").strip()
+            set_located_in(SainsburysSpider.SAINSBURYS, item)
+        if item["name"].endswith(" Local"):
+            item["name"] = item["name"].removesuffix(" Local")
+            set_located_in(SainsburysSpider.SAINSBURYS_LOCAL, item)
+        item["branch"] = item.pop("name").removesuffix(" Argos")
+        item["website"] = item["website"].replace("(", "").replace(")", "").replace("'", "")
+        yield item

@@ -1,72 +1,42 @@
-# -*- coding: utf-8 -*-
-import re
-import scrapy
-from locations.items import GeojsonPointItem
+import json
+from typing import Any
+
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
+
+from locations.dict_parser import DictParser
 from locations.hours import OpeningHours
 
 
-class MichaelsSpider(scrapy.Spider):
-    download_delay = 0.2
+class MichaelsSpider(SitemapSpider):
     name = "michaels"
-    item_attributes = { 'brand': "Michaels", 'brand_wikidata': "Q6835667" }
-    allowed_domains = ["michaels.com"]
-    start_urls = (
-        'http://locations.michaels.com/',
-    )
+    item_attributes = {"brand": "Michaels", "brand_wikidata": "Q6835667"}
+    sitemap_urls = ["https://locations.michaels.com/sitemap.xml.gz", "https://locationsca.michaels.com/sitemap.xml.gz"]
 
-    def parse(self, response):
-        urls = response.xpath('//a[@class="contentlist_item"]/@href').extract()
+    sitemap_rules = [(r"https://\w+\.michaels\.com/[^/]+/[^/]+/\d+/$", "parse")]
+    requires_proxy = True
 
-        for url in urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_state)
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        raw_data = json.loads(response.xpath('//*[@id="__NEXT_DATA__" ]/text()').get())["props"]["pageProps"][
+            "response"
+        ]
+        item = DictParser.parse(raw_data)
+        item["email"] = None
+        item["lat"] = raw_data["coords_latitude"]
+        item["lon"] = raw_data["coords_longitude"]
+        item["branch"] = raw_data["michaels_store_name"]
+        item["website"] = item["ref"] = response.url
+        oh = OpeningHours()
+        for day_time in response.xpath('//*[@class="css-1h9mp0"]'):
+            day = day_time.xpath('.//*[@class="css-87dqa9"]/p/text()').get()
+            open_close_time = day_time.xpath("./p/text()").get()
+            if open_close_time == "CLOSED":
+                oh.set_closed(day)
+            else:
+                open_time, close_time = open_close_time.split("-")
+                oh.add_range(
+                    day=day, open_time=open_time.strip(), close_time=close_time.strip(), time_format="%I:%M %p"
+                )
+        item["opening_hours"] = oh
 
-
-    def parse_state(self, response):
-        location_urls = response.xpath('//a[@class="contentlist_item"]/@href').extract()
-
-        for url in location_urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_city)
-
-    def parse_city(self, response):
-        city_urls = response.xpath('//div[@id="locations"]//ul/a/@href').extract()
-
-        for url in city_urls:
-            yield scrapy.Request(response.urljoin(url), callback=self.parse_location)
-
-    def parse_location(self, response):
-        ref = re.search(r'.+/(.+)', response.url).group(1)
-
-        properties = {
-            'ref': ref.strip('/'),
-            'addr_full': response.xpath('//meta[@property="business:contact_data:street_address"]/@content').extract_first(),
-            'city': response.xpath('//meta[@property="business:contact_data:locality"]/@content').extract_first(),
-            'state': response.xpath('//meta[@property="business:contact_data:region"]/@content').extract_first(),
-            'postcode': response.xpath('//meta[@property="business:contact_data:postal_code"]/@content').extract_first(),
-            'phone': response.xpath('//meta[@property="business:contact_data:phone_number"]/@content').extract_first(),
-            'name': response.xpath('//div[@class="address"]/span/text()').extract()[1],
-            'country': response.xpath('//meta[@property="business:contact_data:country_name"]/@content').extract_first(),
-            'lat': float(response.xpath('//meta[@property="place:location:latitude"]/@content').extract_first()),
-            'lon': float(response.xpath('//meta[@property="place:location:longitude"]/@content').extract_first()),
-            'website': response.url
-        }
-
-        hours = self.parse_hours(response.xpath('//time[@itemprop="openingHours"]/@datetime').extract())
-
-        if hours:
-            properties['opening_hours'] = hours
-
-        yield GeojsonPointItem(**properties)
-
-    def parse_hours(self, response):
-        opening_hours = OpeningHours()
-        weekdays = response
-
-        for weekday in weekdays:
-            day, hrs = weekday.split(' ')
-            open, close = hrs.split('-')
-            opening_hours.add_range(day,
-                                    open_time=open,
-                                    close_time=close,
-                                    time_format='%H:%M')
-
-        return opening_hours.as_opening_hours()
+        yield item

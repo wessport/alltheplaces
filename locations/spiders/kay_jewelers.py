@@ -1,0 +1,57 @@
+import json
+from typing import AsyncIterator
+
+from scrapy import Spider
+from scrapy.http import JsonRequest
+
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.geo import point_locations
+from locations.hours import DAYS, OpeningHours
+
+
+class KayJewelersSpider(Spider):
+    name = "kay_jewelers"
+    item_attributes = {"brand": "Kay Jewelers", "brand_wikidata": "Q62029290"}
+
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for lat, lon in point_locations("us_centroids_50mile_radius.csv"):
+            url = (
+                f"https://stores.kay.com/umbraco/api/search/GetDataByCoordinates?longitude={lon}&latitude={lat}"
+                f"&distance=50&units=miles" + "&filter={%22ReportGroup%22:%22Kay%22}"
+            )
+            yield JsonRequest(url)
+
+    def parse(self, response):
+        data = json.loads(response.json())["StoreLocations"]
+        if len(data) > 0:
+            for poi in data:
+                poi_addr = poi["ExtraData"]["Address"]
+                item = DictParser.parse(poi)
+                item["name"] = None
+                item["street_address"] = item.pop("addr_full", None)
+                item["state"] = poi_addr.get("Region")
+                item["country"] = poi_addr.get("CountryCode")
+                item["city"] = poi_addr.get("Locality")
+                item["postcode"] = poi_addr.get("PostalCode")
+                item["phone"] = poi["ExtraData"]["Phone"]
+                item["ref"] = poi["ExtraData"]["ReferenceCode"]
+                coords = poi["Location"]["coordinates"]
+                item["lon"], item["lat"] = coords[0], coords[1]
+
+                self.opening_hours(poi["ExtraData"].get("HoursOfOpStruct"), item)
+                apply_category(Categories.SHOP_JEWELRY, item)
+
+                yield item
+
+    def opening_hours(self, hours, item):
+        if not hours:
+            return
+
+        oh = OpeningHours()
+        for day, info in hours.items():
+            if day in DAYS:
+                if times := info["Ranges"]:
+                    for time in times:
+                        oh.add_range(day, time["StartTime"], time["EndTime"], "%I:%M%p")
+        item["opening_hours"] = oh

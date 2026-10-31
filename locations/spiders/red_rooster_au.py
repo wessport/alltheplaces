@@ -1,0 +1,78 @@
+from typing import AsyncIterator
+
+from scrapy import Spider
+from scrapy.http import JsonRequest
+
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.hours import OpeningHours
+from locations.items import Feature
+
+
+class RedRoosterAUSpider(Spider):
+    name = "red_rooster_au"
+    item_attributes = {"brand": "Red Rooster", "brand_wikidata": "Q376466"}
+    start_urls = ["https://d3c377j0gjsips.cloudfront.net/rr_all_store_sync.json"]
+    allowed_domains = ["d3c377j0gjsips.cloudfront.net"]
+
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for url in self.start_urls:
+            yield JsonRequest(url=url)
+
+    def parse(self, response):
+        for location in response.json()["data"]:
+            attributes = location["attributes"]
+            if attributes.get("isEnabled") is False or attributes.get("isEnabledForTrading") is not True:
+                # Ignore disabled locations.
+                continue
+            if attributes["storeName"].rstrip().lower().endswith(("- closed", "- inactive")):
+                # Closed stores are renamed "... - Closed" but usually stay isEnabledForTrading.
+                continue
+            store_address = location["relationships"].get("storeAddress")
+            if not store_address or not store_address.get("data"):
+                continue
+
+            # Note: unit, floor and streetNumber fields are present but never
+            # used. These fields can be ignored.
+            address_fields = location["relationships"]["storeAddress"]["data"]["attributes"]["addressComponents"]
+
+            properties = {
+                "ref": location["id"],
+                "branch": location["attributes"]["storeName"].removeprefix("Red Rooster "),
+                "lat": address_fields.get("latitude", {}).get("value"),
+                "lon": address_fields.get("longitude", {}).get("value"),
+                "street_address": address_fields.get("streetName", {}).get("value"),
+                "city": address_fields.get("suburb", {}).get("value"),
+                "state": address_fields.get("state", {}).get("value"),
+                "postcode": address_fields.get("postcode", {}).get("value"),
+                "email": location["attributes"].get("storeEmail"),
+                "phone": location["attributes"].get("storePhone"),
+                "website": "https://www.redrooster.com.au/locations/"
+                + location["relationships"]["slug"]["data"]["attributes"]["slug"],
+            }
+
+            properties["opening_hours"] = OpeningHours()
+            for day_hours in location["relationships"]["collection"]["data"]["attributes"]["collectionTimes"]:
+                for time_period in day_hours["collectionTimePeriods"]:
+                    properties["opening_hours"].add_range(
+                        day_hours["dayOfWeek"], time_period["openTime"], time_period["closeTime"], "%H:%M:%S"
+                    )
+
+            apply_category(Categories.FAST_FOOD, properties)
+            apply_yes_no(
+                Extras.DRIVE_THROUGH,
+                properties,
+                location["relationships"]["collection"]["data"]["attributes"]["pickupTypes"]["driveThru"],
+                False,
+            )
+            apply_yes_no(Extras.DELIVERY, properties, location["attributes"]["isDeliveryEnabled"], False)
+            apply_yes_no(
+                Extras.WIFI, properties, location["relationships"]["amenities"]["data"]["attributes"]["haveWifi"], False
+            )
+            apply_yes_no(
+                Extras.TOILETS,
+                properties,
+                location["relationships"]["amenities"]["data"]["attributes"]["haveToilet"],
+                False,
+            )
+
+            yield Feature(**properties)

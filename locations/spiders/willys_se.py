@@ -1,0 +1,42 @@
+from typing import Iterable
+
+from scrapy.http import Response
+
+from locations.hours import DAYS_SE, OpeningHours, sanitise_day
+from locations.items import Feature
+from locations.json_blob_spider import JSONBlobSpider
+
+
+class WillysSESpider(JSONBlobSpider):
+    name = "willys_se"
+    item_attributes = {"brand": "Willys", "brand_wikidata": "Q10720214"}
+    start_urls = ["https://www.willys.se/axfood/rest/store"]
+    custom_settings = {"ROBOTSTXT_OBEY": False}
+
+    def post_process_item(self, item: Feature, response: Response, feature: dict) -> Iterable[Feature]:
+        if not item["street_address"]:  # Not enough location data
+            return
+
+        if item["name"].startswith("Willys Hemma "):
+            item["branch"] = item.pop("name").removeprefix("Willys Hemma ")
+            item["name"] = "Willys Hemma"
+        else:
+            item["branch"] = item.pop("name").removeprefix("Willys ")
+
+        item["phone"] = feature["address"].get("phone")
+        item["website"] = "https://www.willys.se/butik/{}".format(item["ref"])
+
+        item["opening_hours"] = self.parse_opening_hours(feature.get("openingHours", []))
+
+        yield item
+
+    def parse_opening_hours(self, opening_hours: list) -> OpeningHours:
+        oh = OpeningHours()
+        for rule in opening_hours:
+            day, times = rule.split(" ")
+            if day := sanitise_day(day, DAYS_SE):
+                if times == "stängd":
+                    oh.set_closed(day)
+                else:
+                    oh.add_range(day, *times.split("-"))
+        return oh

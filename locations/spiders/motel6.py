@@ -1,51 +1,32 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-from locations.items import GeojsonPointItem
+from typing import Iterable
 
-brand_lookup = {
-    "MS": "Motel 6",
-    "SS": "Studio 6",
-    "HS": "Hotel 6"
-}
+from scrapy.http import TextResponse
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.settings import DEFAULT_PLAYWRIGHT_SETTINGS
+from locations.structured_data_spider import StructuredDataSpider
+from locations.user_agents import BROWSER_DEFAULT
 
 
-class Motel6Spider(scrapy.Spider):
+class Motel6Spider(SitemapSpider, StructuredDataSpider):
     name = "motel6"
-    allowed_domains = ["motel6.com"]
-    start_urls = (
-        'https://www.motel6.com/var/g6/hotel-summary/ms.infinity.1.json',
-    )
+    BRANDS = {
+        "Studio 6": {"brand": "Studio 6", "brand_wikidata": "Q115793950"},
+        "Motel 6": {"brand": "Motel 6", "brand_wikidata": "Q2188884"},
+    }
+    sitemap_urls = ["https://www.motel6.com/sitemap.xml"]
+    sitemap_rules = [("/property/", "parse_sd")]
+    is_playwright_spider = True
+    custom_settings = DEFAULT_PLAYWRIGHT_SETTINGS | {"USER_AGENT": BROWSER_DEFAULT, "DOWNLOAD_DELAY": 5}
 
-    def parse(self, response):
-        idata = json.loads(response.body_as_unicode())
-        storeids = idata.keys()
-        URL = 'https://www.motel6.com/var/g6/hotel-information/en/{}.json'
-        for storeid in storeids:
-            try:
-                int(storeid)
-            except ValueError:
-                continue
-            try:
-                yield scrapy.Request(URL.format(storeid), callback=self.parse_hotel)
-            except ValueError:
-                continue
-
-    def parse_hotel(self, response):
-        mdata = json.loads(response.body_as_unicode())
-
-        properties = {
-                    'ref': mdata["property_id"],
-                    'name': mdata["name"],
-                    'addr_full': mdata["address"],
-                    'city': mdata["city"],
-                    'postcode': mdata["zip"],
-                    'lat': mdata["latitude"],
-                    'lon': mdata["longitude"],
-                    'phone': mdata["phone"],
-                    'state': mdata["state"],
-                    'website': mdata["microsite_url"],
-                    'brand': brand_lookup[mdata["brand_id"]],
-        }
-
-        yield GeojsonPointItem(**properties)
+    def post_process_item(self, item: Feature, response: TextResponse, ld_data: dict, **kwargs) -> Iterable[Feature]:
+        if item["name"] == "Studio 6" or item["name"].startswith("Studio 6 "):
+            item["name"] = "Studio 6"
+            item.update(self.BRANDS[item["name"]])
+        else:
+            item["name"] = "Motel 6"
+            item.update(self.BRANDS[item["name"]])
+        apply_category(Categories.MOTEL, item)
+        yield item

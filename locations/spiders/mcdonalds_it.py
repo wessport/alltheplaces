@@ -1,107 +1,53 @@
-import json
-import re
-import scrapy
-from locations.items import GeojsonPointItem
+from typing import Any
+from urllib.parse import urljoin
 
-class McDonaldsITSpider(scrapy.Spider):
+from scrapy.http import Response
+
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.hours import OpeningHours
+from locations.playwright_spider import PlaywrightSpider
+from locations.settings import DEFAULT_PLAYWRIGHT_SETTINGS
+from locations.user_agents import BROWSER_DEFAULT
+
+
+class McdonaldsITSpider(PlaywrightSpider):
     name = "mcdonalds_it"
-    item_attributes = { 'brand': "McDonald's" }
-    allowed_domains = ["mcdonaldsstoreplatform.adattivo.com"]
+    item_attributes = {"brand": "McDonald's", "brand_wikidata": "Q38076"}
+    start_urls = ["https://www.mcdonalds.it/static/json/store_locator.json"]
+    custom_settings = {"ROBOTSTXT_OBEY": False, "USER_AGENT": BROWSER_DEFAULT} | DEFAULT_PLAYWRIGHT_SETTINGS
 
-    def start_requests(self):
-        url = 'https://mcdonaldsstoreplatform.adattivo.com/v2/sites'
-        headers = {
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Origin': 'https://www.mcdonalds.it',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept': 'application/vnd.storeplatform.v2+json',
-            'Referer': 'https://www.mcdonalds.it/ristorante'
-        }
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for store in response.json()["sites"]:
+            store["street_address"] = store.pop("address")
+            item = DictParser.parse(store)
+            item["branch"] = item.pop("name")
+            item["website"] = urljoin("https://www.mcdonalds.it/ristorante/", store["uri"])
 
-        yield scrapy.http.FormRequest(
-            url=url, method='GET',
-            headers=headers, callback=self.parse
-        )
-    
-    def normalize_time(self, time_str, flag):
-        match = re.search(r'([0-9]{1,2}).([0-9]{1,2})', time_str)
-        h, m = match.groups()
+            for opening_hours in store["opening_hours"]:
+                if opening_hours["name"] == "mccafe":
+                    mccafe = item.deepcopy()
+                    item["ref"] = "{}-mccafe".format(item["ref"])
+                    mccafe["brand"] = "McCafé"
+                    mccafe["brand_wikidata"] = "Q3114287"
+                    apply_category(Categories.CAFE, mccafe)
+                    mccafe["opening_hours"] = self.parse_opening_hours(opening_hours)
+                    yield mccafe
+                elif opening_hours["name"] == "mcdrive":
+                    item["extras"]["opening_hours:drive_through"] = self.parse_opening_hours(opening_hours)
+                elif opening_hours["name"] == "restaurant":
+                    item["opening_hours"] = self.parse_opening_hours(opening_hours)
 
-        return '%02d:%02d' % (
-            int(h) + 12 if flag and int(h)<13 else int(h),
-            int(m),
-        )
+            apply_category(Categories.FAST_FOOD, item)
 
-    def store_hours(self, data):
-        day_groups = []
-        this_day_group = {}
-        day_hours = data["days"]
-        for day_hour in day_hours:
-            hours = ''
-            day = day_hour['name']
-            work_time = day_hour['times']
-            if not work_time:
-                return None
-            start = work_time.split(",")[0].strip()
-            end = work_time.split(",")[1].strip()
-            start = self.normalize_time(start, False)
-            end = self.normalize_time(end, True)
-            if day == "Day":
-                continue
-            short_day = day[:2]
-            hours = '{}:{}-{}:{}'.format(start[:2], start[3:], end[:2], end[3:])
-            if not this_day_group:
-                this_day_group = {
-                    'from_day': short_day,
-                    'to_day': short_day,
-                    'hours': hours,
-                }
+            yield item
 
-            elif hours == this_day_group['hours']:
-                this_day_group['to_day'] = short_day
+    def parse_opening_hours(self, rules: dict) -> str:
+        if rules["all24h"] is True:
+            return "24/7"
 
-            elif hours != this_day_group['hours']:
-                day_groups.append(this_day_group)
-                this_day_group = {
-                    'from_day': short_day,
-                    'to_day': short_day,
-                    'hours': hours,
-                }
-
-        day_groups.append(this_day_group)
-
-        if not day_groups:
-            return None
-        opening_hours = ''
-        if len(day_groups) == 1 and day_groups[0]['hours'] in ('00:00-23:59', '00:00-00:00'):
-            opening_hours = '24/7'
-        else:
-            for day_group in day_groups:
-                if day_group['from_day'] == day_group['to_day']:
-                    opening_hours += '{from_day} {hours}; '.format(**day_group)
-                else:
-                    opening_hours += '{from_day}-{to_day} {hours}; '.format(**day_group)
-            opening_hours = opening_hours [:-2]
-
-        return opening_hours
-
-    def parse(self, response):
-        results = json.loads(response.body_as_unicode())
-        stores = results["sites"]
-        for item in stores:
-            properties = {
-                'ref': item['id'],
-                'name': item['title'],
-                'addr_full': item['googlefaddress'],
-                'lat': item['geo']['lat'],
-                'lon': item['geo']['lng'],
-                'phone': item['telephone'],
-                'city': item['city']
-            }
-
-            opening_hours = self.store_hours(item['opening_hours'][0])
-            if opening_hours:
-                properties['opening_hours'] = opening_hours
-
-            yield GeojsonPointItem(**properties)
-
+        oh = OpeningHours()
+        for rule in rules["days"]:
+            if rule.get("times"):
+                oh.add_range(rule["name"], *rule["times"].split(","))
+        return oh.as_opening_hours()

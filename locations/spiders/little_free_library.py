@@ -1,0 +1,60 @@
+from typing import Any, AsyncIterator
+
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
+
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+
+
+class LittleFreeLibrarySpider(Spider):
+    name = "little_free_library"
+    item_attributes = {"brand": "Little Free Library", "brand_wikidata": "Q6650101"}
+    allowed_domains = ["appapi.littlefreelibrary.org"]
+    start_urls = ["https://appapi.littlefreelibrary.org/library/map.json?page_size=500"]
+    # It takes a long time for the server to provide 500 locations in a
+    # single response. The server rate limits the total number of requests
+    # sent in a brief period of time. Thus it's necessary to ask for more
+    # locations at a time and wait for the slow responses, and also necessary
+    # to add a large delay between requests.
+    custom_settings = {"DOWNLOAD_TIMEOUT": 60, "DOWNLOAD_DELAY": 60}
+
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for url in self.start_urls:
+            yield JsonRequest(url=url, callback=self.parse_library_list)
+
+    def parse_library_list(self, response: Response, **kwargs: Any) -> Any:
+        for library in response.json()["libraries"]:
+            properties = {
+                "ref": library.get("Official_Charter_Number__c"),
+                "lat": library.get("Library_Geolocation__Latitude__s"),
+                "lon": library.get("Library_Geolocation__Longitude__s"),
+                "street_address": library.get("Street__c"),
+                "city": library.get("City__c"),
+                "state": library.get("State_Province_Region__c"),
+                "postcode": library.get("Postal_Zip_Code__c"),
+                "country": library.get("Country__c"),
+                "website": f"https://map.littlefreelibrary.org/{library.get('Official_Charter_Number__c')}",
+                # These fields could potentially be considered
+                # personal/private information and don't add much value
+                # to ATP. It's easier to ignore these fields.
+                # "operator": library.get("Primary_Steward_s_Name__c"),
+                # "phone": library.get("Primary_Steward_s_Phone__c"),
+                # "email": library.get("Primary_Steward_s_Email__c"),
+            }
+            if library.get("Library_Name__c"):
+                properties["name"] = library.get("Library_Name__c")
+            elif library.get("List_As_Name__c"):
+                properties["name"] = library.get("List_As_Name__c")
+            else:
+                properties["name"] = library.get("Name")
+            if images := library.get("image_urls"):
+                properties["image"] = images[0]
+
+            apply_category(Categories.PUBLIC_BOOKCASE, properties)
+
+            yield Feature(**properties)
+
+        if "&page=" not in response.url:
+            for page in range(2, response.json()["page_count"]):
+                yield JsonRequest(response.url + f"&page={page}", callback=self.parse_library_list)

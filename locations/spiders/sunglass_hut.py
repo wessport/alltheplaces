@@ -1,35 +1,67 @@
-import scrapy
-import re
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, apply_category
+from locations.storefinders.yext import YextSpider
 
-class SunglassHutSpider(scrapy.Spider):
+SUNGLASS_HUT_SHARED_ATTRIBUTES = {
+    "brand": "Sunglass Hut",
+    "brand_wikidata": "Q136311",
+    "extras": Categories.OPTOMETRIST.value,
+}
+LENSCRAFTERS_ATTRIBUTES = {"brand": "LensCrafters", "brand_wikidata": "Q6523209"}
+PEARLE_VISION_ATTRIBUTES = {"brand": "Pearle Vision", "brand_wikidata": "Q2231148"}
+TARGET_OPTICAL_ATTRIBUTES = {"brand": "Target Optical", "brand_wikidata": "Q19903688"}
+
+SUNGLASS_HUT_BRANDS = {
+    "DAVID_CLULOW": {"brand": "David Clulow", "extras": Categories.SHOP_OPTICIAN.value},
+    "OLIVER_PEOPLES": {
+        "brand": "Oliver Peoples",
+        "brand_wikidata": "Q7087746",
+        "extras": Categories.SHOP_OPTICIAN.value,
+    },
+    "SALMOIRAGHI_VIGANO": {
+        "brand": "Salmoiraghi & Viganò",
+        "brand_wikidata": "Q21272314",
+        "extras": Categories.SHOP_OPTICIAN.value,
+    },
+    "LC_OD_AT_MACY'S": LENSCRAFTERS_ATTRIBUTES | {"extras": Categories.OPTOMETRIST.value},
+    "LC_OD_NON_TEXAS": LENSCRAFTERS_ATTRIBUTES | {"extras": Categories.OPTOMETRIST.value},
+    "LC_OD_TEXAS": LENSCRAFTERS_ATTRIBUTES | {"extras": Categories.OPTOMETRIST.value},
+    "LENSCRAFTERS": LENSCRAFTERS_ATTRIBUTES | {"extras": Categories.SHOP_OPTICIAN.value},
+    "LENSCRAFTERS_CA": LENSCRAFTERS_ATTRIBUTES | {"extras": Categories.SHOP_OPTICIAN.value},
+    "OAKLEY": {"brand": "Oakley", "brand_wikidata": "Q161906", "extras": Categories.SHOP_OPTICIAN.value},
+    "PEARLE_VISION": PEARLE_VISION_ATTRIBUTES | {"extras": Categories.SHOP_OPTICIAN.value},
+    "PV_OD": PEARLE_VISION_ATTRIBUTES | {"extras": Categories.OPTOMETRIST.value},
+    "RAY-BAN": {"brand": "Ray-Ban", "brand_wikidata": "Q653941", "extras": Categories.SHOP_OPTICIAN.value},
+    "SUNGLASS_HUT": SUNGLASS_HUT_SHARED_ATTRIBUTES,
+    "TARGET_OPTICAL": TARGET_OPTICAL_ATTRIBUTES | {"extras": Categories.SHOP_OPTICIAN.value},
+    "TO_OD": TARGET_OPTICAL_ATTRIBUTES | {"extras": Categories.OPTOMETRIST.value},
+}
+
+
+class SunglassHutSpider(YextSpider):
     name = "sunglass_hut"
-    item_attributes = { 'brand': "Sunglass Hut" }
-    allowed_domains = ["stores.sunglasshut.com"]
-    start_urls = (
-        'https://stores.sunglasshut.com/',
-    )
+    api_key = "2f3a9dda00e30159f040cb1107e21927"
+    api_version = "20220511"
 
-    def parse_opening_hours(self, opening_hours):
-        return ';'.join(opening_hours)
-
-    def parse(self, response):
-        urls = response.xpath('//a[@class="c-directory-list-content-item-link" or @class="c-location-grid-item-link"]/@href').extract()
-        # If cannot find 'c-directory-list-content-item-link' or 'c-location-grid-item-link' then this is a store page
-        if len(urls) == 0:
-            properties = {
-                'addr_full': response.xpath('normalize-space(//div[@class="c-location-info"]//span[@itemprop="streetAddress"]/text())').extract_first(),
-                'city': response.xpath('normalize-space(//div[@class="c-location-info"]//span[@itemprop="addressLocality"]/text())').extract_first().strip(','),
-                'state': response.xpath('normalize-space(//div[@class="c-location-info"]//span[@itemprop="addressRegion"]/text())').extract_first(),
-                'postcode':response.xpath('normalize-space(//div[@class="c-location-info"]//span[@itemprop="postalCode"]/text())').extract_first(),
-                'phone':response.xpath('normalize-space(//div[@class="c-location-info"]//span[@itemprop="telephone"]/text())').extract_first(),
-                'ref': response.url,
-                'website': response.url,
-                'lat': response.xpath('normalize-space(//div[@class="c-location-info"]//meta[@itemprop="latitude"]/@content)').extract_first(),
-                'lon': response.xpath('normalize-space(//div[@class="c-location-info"]//meta[@itemprop="longitude"]/@content)').extract_first(),
-                'opening_hours': self.parse_opening_hours(response.xpath('//meta[@itemprop="openingHours"]/@content').getall()),
-            }
-            yield GeojsonPointItem(**properties)
+    def parse_item(self, item, location):
+        item.pop("twitter", None)
+        item.pop("instagram", None)
+        item.pop("email", None)
+        if item["website"] is not None and "?" in item["website"]:
+            item["website"] = item["website"].split("?")[0]  # strip yext tracking
+        if brand := location.get("c_pagesSubscription"):
+            if brand in SUNGLASS_HUT_BRANDS:
+                item.update(SUNGLASS_HUT_BRANDS.get(brand))
+            else:
+                self.crawler.stats.inc_value(f"atp/{self.name}/unknown_brand/{brand}")
+        elif item["name"].startswith("David Clulow"):
+            item.update(SUNGLASS_HUT_BRANDS.get("DAVID_CLULOW"))
+            item["branch"] = (
+                item.pop("name").replace("David Clulow Opticians - ", "").replace("David Clulow Sunglasses ", "")
+            )
+        elif item["name"].startswith("Oliver Peoples"):
+            item.update(SUNGLASS_HUT_BRANDS.get("OLIVER_PEOPLES"))
+        elif item["name"].startswith("Salmoiraghi & Viganò"):
+            item.update(SUNGLASS_HUT_BRANDS.get("SALMOIRAGHI_VIGANO"))
         else:
-            for path in urls:
-                yield scrapy.Request(response.urljoin(path), callback=self.parse)
+            apply_category(Categories.SHOP_OPTICIAN, item)
+        yield item

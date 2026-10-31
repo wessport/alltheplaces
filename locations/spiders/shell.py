@@ -1,83 +1,101 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
+from locations.categories import (
+    Access,
+    Categories,
+    Extras,
+    Fuel,
+    FuelCards,
+    PaymentMethods,
+    apply_category,
+    apply_yes_no,
+)
+from locations.hours import DAYS, OpeningHours
+from locations.storefinders.geo_me import GeoMeSpider
 
-from locations.items import GeojsonPointItem
 
-
-class ShellSpider(scrapy.Spider):
+class ShellSpider(GeoMeSpider):
     name = "shell"
-    item_attributes = {'brand': "Shell", 'brand_wikidata': "Q154950"}
-    allowed_domains = ["shellgsllocator.geoapp.me"]
-    download_delay = 0.2
-    start_urls = [
-        "https://shellgsllocator.geoapp.me/api/v1/locations/within_bounds?sw%5B%5D=-90&sw%5B%5D=-180&ne%5B%5D=90&ne%5B%5D=180"
-    ]
+    item_attributes = {"brand": "Shell", "brand_wikidata": "Q110716465"}
+    api_key = "shellgsllocator"
 
-    def parse(self, response):
-        result = json.loads(response.body_as_unicode())
+    def parse_item(self, item, location):
+        # Definitions extracted from https://shellgsllocator.geoapp.me/config/published/retail/prod/en_US.json?format=json
+        amenities = location["amenities"]
+        fuels = location["fuels"]
 
-        if isinstance(result, list):
-            for item in result:
-                # This within_bounds endpoint always returns an array with one of
-                # two kinds of response.
-                #
-                # 1. An array of smaller bounding boxes with counts
-                # 2. An array of station listings
-                if 'bounds' in item:
-                    b = item['bounds']
+        # As we know the name of the shop attached we create its own POI
+        if "selectshop" in amenities:
+            select_shop_item = item.deepcopy()
+            select_shop_item["ref"] = item.get("ref") + "-attached-shop"
+            select_shop_item["name"] = "Shell Select"
+            select_shop_item["brand"] = "Shell Select"
+            select_shop_item["brand_wikidata"] = "Q124359752"
+            if item.get("shop_open_status") == "twenty_four_hour":
+                item["opening_hours"] = "Mo-Su 00:00-24:00"
+            apply_category(Categories.SHOP_CONVENIENCE, select_shop_item)
+            yield select_shop_item
 
-                    yield scrapy.Request(
-                        f"https://shellgsllocator.geoapp.me/api/v1/locations/within_bounds?sw%5B%5D={b['sw'][0]}&sw%5B%5D={b['sw'][1]}&ne%5B%5D={b['ne'][0]}&ne%5B%5D={b['ne'][1]}"
-                    )
-                elif 'name' in item:
-                    yield scrapy.Request(f"https://shellgsllocator.geoapp.me/api/v1/locations/{item['id']}")
+        if location.get("site_category") in [
+            "destination_charging_ev",
+            "mobility_hub_ev_plus_hub",
+            "mobility_hub_ev_hub",
+        ]:
+            apply_category(Categories.CHARGING_STATION, item)
         else:
-            if result['inactive']:
-                return
+            apply_category(Categories.FUEL_STATION, item)
 
-            amenities = result['amenities']
-            fuels = result['fuels']
+        item.pop("name", None)
 
-            yield GeojsonPointItem(
-                lat=result['lat'],
-                lon=result['lng'],
-                name=result['name'],
-                addr_full=result['address'],
-                city=result['city'],
-                state=result['state'],
-                postcode=result['postcode'],
-                country=result['country_code'],
-                opening_hours='24/7' if 'twenty_four_hour' in amenities else '',
-                phone=result['telephone'],
-                website=result['website_url'],
-                ref=result['id'],
-                # Definitions extracted from https://shellgsllocator.geoapp.me/config/published/retail/prod/en_US.json?format=json
-                extras={
-                    'amenity:chargingstation': 'electric_charging_other' in fuels or 'shell_recharge' in fuels,
-                    'amenity:fuel': True,
-                    'amenity:toilets': 'toilet' in amenities,
-                    'atm': 'atm' in amenities,
-                    'car_wash': 'carwash' in amenities,
-                    'fuel:adblue': any('adblue' in a for a in amenities) or None,
-                    'fuel:biodiesel': 'biodiesel' in fuels or 'biofuel_gasoline' in fuels or None,
-                    'fuel:cng': 'cng' in fuels or None,
-                    'fuel:diesel': any('diesel' in f for f in fuels) or None,
-                    'fuel:GTL_diesel': 'gtl' in fuels or None,
-                    'fuel:HGV_diesel': 'truck_diesel' in fuels or 'hgv_lane' in amenities or None,
-                    'fuel:LH2': 'hydrogen' in fuels or None,
-                    'fuel:lng': 'lng' in fuels or None,
-                    'fuel:lpg': 'autogas_lpg' in fuels or None,
-                    'fuel:octane_100': 'super_premium_gasoline' in fuels or None,
-                    # definition of low-octane varies by country; 92 is most common
-                    'fuel:octane_92': 'low_octane_gasoline' in fuels or None,
-                    # definition of mid-octane varies by country; 95 is most common
-                    'fuel:octane_95': any('midgrade_gasoline' in f for f in fuels) or 'unleaded_super' in fuels or None,
-                    # the US region seems to also use 'premium_gasoline' to refer to non-diesel gas products
-                    'fuel:octane_98': any('98' in f for f in fuels) or 'premium_gasoline' in fuels or None,
-                    'fuel:propane': 'auto_rv_propane' in fuels or None,
-                    'hgv': 'hgv_lane' in amenities,
-                    'shop': 'convenience' if 'shop' in 'amenities' else None,
-                    'wheelchair': 'disabled_facilities' in amenities,
-                }
-            )
+        # As we do not know the name of shop/restaurant attached, we apply to main item
+        if "shop" in amenities:
+            apply_yes_no("shop", item, True)
+        if "restaurant" in amenities:
+            apply_yes_no("food", item, True)
+
+        if "twenty_four_hour" in amenities:
+            item["opening_hours"] = OpeningHours()
+            item["opening_hours"].add_days_range(DAYS, "00:00", "23:59")
+        if "charging" in amenities or "electric_charging_other" in fuels or "shell_recharge" in fuels:
+            apply_yes_no(Fuel.ELECTRIC, item, True)
+
+        apply_yes_no(Extras.TOILETS, item, any("toilet" in a for a in amenities))
+        apply_yes_no(Extras.TOILETS_WHEELCHAIR, item, "wheelchair_accessible_toilet" in amenities)
+        apply_yes_no(Extras.BABY_CHANGING_TABLE, item, "baby_change_facilities" in amenities)
+        apply_yes_no(Extras.SHOWERS, item, "shower" in amenities)
+        apply_yes_no(Extras.ATM, item, "atm" in amenities or "atm_in" in amenities or "atm_out" in amenities)
+        apply_yes_no(
+            Extras.CAR_WASH, item, any("carwash" in a for a in amenities) or any("car_wash" in a for a in amenities)
+        )
+        apply_yes_no(Extras.WHEELCHAIR, item, "disabled_facilities" in amenities)
+        apply_yes_no(Extras.COMPRESSED_AIR, item, "air_and_water" in amenities)
+        apply_yes_no(Extras.VACUUM_CLEANER, item, "vacuum" in amenities)
+        apply_yes_no(Extras.WIFI, item, "wifi" in amenities)
+        apply_yes_no(Access.HGV, item, "hgv_lane" in amenities)
+        apply_yes_no(Fuel.DIESEL, item, any("diesel" in f for f in fuels))
+        apply_yes_no(Fuel.ADBLUE, item, any("adblue" in a for a in amenities))
+        apply_yes_no(Fuel.BIODIESEL, item, "biodiesel" in fuels or "biofuel_gasoline" in fuels)
+        apply_yes_no(Fuel.CNG, item, "cng" in fuels)
+        apply_yes_no(Fuel.GTL_DIESEL, item, "gtl" in fuels)
+        apply_yes_no(Fuel.HGV_DIESEL, item, "truck_diesel" in fuels or "hgv_lane" in amenities)
+        apply_yes_no(Fuel.PROPANE, item, "auto_rv_propane" in fuels)
+        apply_yes_no(Fuel.LH2, item, "hydrogen" in fuels)
+        apply_yes_no(Fuel.LNG, item, "lng" in fuels)
+        apply_yes_no(Fuel.LPG, item, "autogas_lpg" in fuels)
+        # Definition of low-octane varies by country; 92 is most common
+        apply_yes_no(Fuel.OCTANE_92, item, "low_octane_gasoline" in fuels)
+        # Definition of mid-octane varies by country; 95 is most common
+        apply_yes_no(Fuel.OCTANE_95, item, any("midgrade_gasoline" in f for f in fuels) or "unleaded_super" in fuels)
+        # The US region seems to also use 'premium_gasoline' to refer to non-diesel gas products
+        apply_yes_no(Fuel.OCTANE_98, item, any("98" in f for f in fuels) or "premium_gasoline" in fuels)
+        apply_yes_no(Fuel.OCTANE_100, item, "super_premium_gasoline" in fuels)
+        apply_yes_no(Fuel.ENGINE_OIL, item, "oil_and_lubricants" in amenities)
+        apply_yes_no(PaymentMethods.VISA, item, "credit_card_visa" in amenities)
+        apply_yes_no(PaymentMethods.MASTER_CARD, item, "credit_card_mastercard" in amenities)
+        apply_yes_no(PaymentMethods.AMERICAN_EXPRESS, item, "credit_card_american_express" in amenities)
+        apply_yes_no(PaymentMethods.DINERS_CLUB, item, "credit_card_diners_club" in amenities)
+        apply_yes_no(PaymentMethods.APPLE_PAY, item, "apple_pay" in amenities)
+        apply_yes_no(PaymentMethods.GOOGLE_PAY, item, "google_pay" in amenities)
+        apply_yes_no(FuelCards.SHELL, item, "shell_card" in amenities or "euroshell_card" in amenities)
+        apply_yes_no(FuelCards.DKV, item, "fleet_card_dkv" in amenities)
+        apply_yes_no(FuelCards.ESSO_NATIONAL, item, "fleet_card_esso" in amenities)
+        apply_yes_no(FuelCards.UTA, item, "fleet_card_uta" in amenities)
+        yield item

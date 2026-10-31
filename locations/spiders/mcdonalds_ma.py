@@ -1,67 +1,45 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-import re
-from locations.items import GeojsonPointItem
+from typing import Any
+
+from scrapy.http import Response
+
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.items import Feature
+from locations.playwright_spider import PlaywrightSpider
+from locations.settings import DEFAULT_PLAYWRIGHT_SETTINGS
+from locations.spiders.mcdonalds import McdonaldsSpider
+from locations.user_agents import BROWSER_DEFAULT
 
 
-class McDonalsMASpider(scrapy.Spider):
-
+class McdonaldsMASpider(PlaywrightSpider):
     name = "mcdonalds_ma"
-    item_attributes = { 'brand': "McDonald's" }
+    item_attributes = McdonaldsSpider.item_attributes
     allowed_domains = ["www.mcdonalds.ma"]
-    start_urls = (
-        'http://www.mcdonalds.ma/nos-restaurants/r%C3%A9seau-maroc',
-    )
+    start_urls = ["https://www.mcdonalds.ma/nos-restaurants"]
+    custom_settings = DEFAULT_PLAYWRIGHT_SETTINGS | {"USER_AGENT": BROWSER_DEFAULT}
+    no_refs = True
 
-    def parse_address(self, data):
-        address = ""
-        city = ""
-        matches = re.finditer(r"([\w|\s|\,]{1,}) <br>", data)
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for location in response.xpath('//*[@class="gridRestaurants"]//*[@data-services]'):
+            item = Feature()
+            item["branch"] = (
+                location.xpath('.//*[@class="title"]/text()').get("").strip().removeprefix("Restaurant McDonald's ")
+            )
+            item["addr_full"] = location.xpath('.//*[@class="adress"]/text()').get("")
 
-        for matchNum, match in enumerate(matches):
-            if matchNum == 0:
-                address = match.groups()[0].strip()
-            elif matchNum == 1:
-                city = match.groups()[0].strip()
+            services = [service.strip().lower() for service in location.xpath("./@data-services").get("").split(",")]
 
-        return address, city
+            if "mccafe" in services:
+                mccafe = item.deepcopy()
+                mccafe["brand"] = "McCafé"
+                mccafe["brand_wikidata"] = "Q3114287"
+                apply_category(Categories.CAFE, mccafe)
+                yield mccafe
 
-    def parse_phone(self, data):
-        match = re.search(r'Tél : (.[\d|\s]{1,})', data)
-        if not match:
-            return ""
-        return match.groups()[0].strip()
+            apply_yes_no(Extras.WIFI, item, "wifi" in services)
+            apply_yes_no(Extras.OUTDOOR_SEATING, item, "terrasse" in services)
+            apply_yes_no(Extras.DELIVERY, item, "mcdelivery" in services)
+            apply_yes_no(Extras.DRIVE_THROUGH, item, "mcdrive" in services)
 
-    def parse_position(self, data):
-        lat = ""
-        lon = ""
-        latlon = data.xpath(".//div[@class='linktomap']/a/@href").extract_first().strip()
-        match = re.search(r'al=([\-|\d|\.]{1,})&lo=([\-|\d|\.]{1,})', latlon)
-        lat, lon = match.groups()
-        return lat, lon
+            apply_category(Categories.FAST_FOOD, item)
 
-
-    def parse(self, response):
-        stores = response.xpath('//div[@class="cont_restau_infos"]')
-        index = 0
-        for store in stores:
-            name = store.xpath('.//span[@class="restauName"]/text()').extract_first().strip()
-            data = store.extract().strip()
-            address, city = self.parse_address(data)
-            phone = self.parse_phone(data)
-            lat, lon = self.parse_position(store)
-
-            properties = {
-                'city': city,
-                'ref': index,
-                'addr_full': address,
-                'phone': phone,
-                'name': name,
-                'lat': lat,
-                'lon': lon,
-            }
-
-            index = index + 1
-
-            yield GeojsonPointItem(**properties)
+            yield item

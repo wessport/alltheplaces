@@ -1,48 +1,54 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from scrapy import Spider
 
-import scrapy
-
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, Extras, Fuel, apply_category, apply_yes_no
 from locations.hours import OpeningHours
+from locations.items import Feature
 
 
-class KauflandSpider(scrapy.Spider):
+class KauflandSpider(Spider):
     name = "kaufland"
-    item_attributes = {'brand': 'Kaufland', 'brand_wikidata': 'Q685967'}
-    allowed_domains = ["kaufland.de"]
-    start_urls = [
-        'https://filiale.kaufland.de/.klstorefinder.json',
-    ]
+    item_attributes = {"brand": "Kaufland", "brand_wikidata": "Q685967"}
+    website_formats = {
+        "https://www.kaufland.bg/.klstorefinder.json": "https://www.kaufland.bg/moyat-kaufland/uslugi/filiali/{}.html",
+        "https://prodejny.kaufland.cz/.klstorefinder.json": "https://prodejny.kaufland.cz/aktualne/servis/prodejna/{}.html",
+        "https://www.kaufland.hr/.klstorefinder.json": "https://www.kaufland.hr/usluge/poslovnica/{}.html",
+        "https://www.kaufland.md/ro/.klstorefinder.json": "https://www.kaufland.md/ro/utile/magazin/{}.html",
+        "https://sklep.kaufland.pl/.klstorefinder.json": "https://sklep.kaufland.pl/dla-klienta/sklepy/{}.html",
+        "https://www.kaufland.ro/.klstorefinder.json": "https://www.kaufland.ro/utile/magazin/{}.html",
+        "https://predajne.kaufland.sk/.klstorefinder.json": "https://predajne.kaufland.sk/servis/predajne/{}.html",
+        "https://filiale.kaufland.de/.klstorefinder.json": "https://filiale.kaufland.de/service/filiale/{}.html",
+    }
+    start_urls = website_formats.keys()
 
-    def parse_hours(self, hours):
-        opening_hours = OpeningHours()
-        for hour in hours:
-            day, open_time, close_time = hour.split('|')
-            opening_hours.add_range(day=day[:2], open_time=open_time, close_time=close_time)
+    def parse(self, response, **kwargs):
+        for location in response.json():
+            item = Feature()
 
-        return opening_hours.as_opening_hours()
+            item["ref"] = location["n"]
+            item["lat"] = location["lat"]
+            item["lon"] = location["lng"]
+            item["branch"] = location["cn"].removeprefix("KAUFLAND").removeprefix("Kaufland").strip(" -")
+            item["phone"] = location["p"].replace("/", "")
+            item["postcode"] = location["pc"]
+            item["street_address"] = location["sn"]
+            item["city"] = location["t"]
+            item["extras"]["start_date"] = location["opd"]
 
-    def parse(self, response):
-        stores = json.loads(response.body_as_unicode())
+            oh = OpeningHours()
+            for rule in location["wod"]:
+                day, start_time, end_time = rule.split("|")
+                if start_time == "00:00" and end_time == "00:00":
+                    oh.set_closed(day)
+                else:
+                    oh.add_range(day, start_time, end_time)
+            item["opening_hours"] = oh
 
-        for store in stores:
-            properties = {
-                'name': store["cn"],
-                'ref': store["n"],
-                'addr_full': store["sn"],
-                'city': store["t"],
-                'postcode': store["pc"],
-                'country': "DE",
-                'phone': store["p"],
-                'website': "https://www.kaufland.de/service/filiale.storeName={}.html".format(store["n"]),
-                'lat': float(store["lat"]),
-                'lon': float(store["lng"]),
-            }
+            item["website"] = self.website_formats.get(response.url).format(location["friendlyUrl"])
 
-            hours = self.parse_hours(store["wod"])
-            if hours:
-                properties["opening_hours"] = hours
+            services = location["slf"].split(",")
+            apply_yes_no(Extras.TOILETS, item, "Barrier-freeWC" in services)
+            apply_yes_no(Fuel.ELECTRIC, item, "EVChargingStation_normal" in services)
 
-            yield GeojsonPointItem(**properties)
+            apply_category(Categories.SHOP_SUPERMARKET, item)
+
+            yield item

@@ -1,47 +1,43 @@
-# -*- coding: utf-8 -*-
-import json
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
 
-import scrapy
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.structured_data_spider import StructuredDataSpider
 
-from locations.items import GeojsonPointItem
 
-
-class SocieteGeneraleSpider(scrapy.Spider):
+class SocieteGeneraleSpider(SitemapSpider, StructuredDataSpider):
     name = "societe_generale"
-    item_attributes = {'brand': 'Societe Generale', 'brand_wikidata': 'Q270363'}
-    allowed_domains = ["societegenerale.com"]
-    start_urls = [
-        'https://www.societegenerale.com/en/about-us/our-businesses/our-locations',
+    SG = {"name": "SG", "brand": "SG", "brand_wikidata": "Q270363"}
+    CASH_SERVICE = {"brand": "Cash Service", "brand_wikidata": ""}
+    allowed_domains = ["agences.sg.fr"]
+    sitemap_urls = ["https://agences.sg.fr/banque-assurance/sitemap_index.xml"]
+    sitemap_follow = [
+        "particulier/sitemap_pois",
+        "distributeur-automate/sitemap_pois",
     ]
+    sitemap_rules = [(r"/.+-id(\d+)$", "parse_sd")]
+    custom_settings = {"DOWNLOAD_TIMEOUT": 300}
 
-    def parse(self, response):
-        template = 'https://www.societegenerale.com/implentation/map-filter?lang=en-soge&country={country}&job=allmet&entity=allent'
+    def pre_process_data(self, ld_data: dict, **kwargs):
+        ld_data.pop("@id", None)
 
+    def post_process_item(self, item: Feature, response: Response, ld_data: dict, **kwargs):
+        if "Cash Service" in item["name"].title():
+            item.update(self.CASH_SERVICE)
+        else:
+            item["branch"] = item.pop("name").title().removeprefix("Agence ")
+            item.update(self.SG)
 
-        countries = response.xpath('//select[@id="country"]/optgroup/option/text()').extract()
+        if "distributeur-automate" in response.url:
+            item["ref"] += "_atm"
+            apply_category(Categories.ATM, item)
+        else:
+            apply_category(Categories.BANK, item)
 
-        for country in countries:
-            if country == "All countries":
-                pass
-            else:
-                url = template.format(country=country)
-                yield scrapy.Request(url, callback=self.parse_location)
+        if item.get("image") and "agence-sg.jpg" in item["image"]:
+            # Ignore generic image of a store that is used as a placeholder
+            # when a location-specific image is not available.
+            item.pop("image")
 
-
-    def parse_location(self, response):
-        data = json.loads(response.body_as_unicode())
-        stores = data["markers"]["places"]
-        for store in stores:
-            properties = {
-                'ref': "{}_{}".format(store["name"].lower().replace(' ', '_'), store["id"]),
-                'name': store["name"],
-                'addr_full': store["address"],
-                'city': store["city"],
-                'country': store["country"],
-                'phone': store["phone"],
-                'lat': float(store["latitude"]),
-                'lon': float(store["longitude"]),
-                'website': store.get("url")
-            }
-
-            yield GeojsonPointItem(**properties)
+        yield item

@@ -1,41 +1,17 @@
-# -*- coding: utf-8 -*-
-import re
+from typing import AsyncIterator
 
-import scrapy
+from scrapy.http import JsonRequest
 
-from locations.items import GeojsonPointItem
+from locations.geo import city_locations
+from locations.spiders.dominos_pizza_au import DominosPizzaAUSpider
 
 
-class DominosPizzaJPSpider(scrapy.Spider):
+class DominosPizzaJPSpider(DominosPizzaAUSpider):
     name = "dominos_pizza_jp"
-    item_attributes = {'brand': "Domino's Pizza", 'brand_wikidata': "Q839466"}
-    allowed_domains = ['dominos.jp']
-    start_urls = [
-        'https://www.dominos.jp/sitemap.aspx',
-    ]
-    download_delay = 0.3
+    item_attributes = {"brand_wikidata": "Q839466"}
 
-    def parse(self, response):
-        response.selector.remove_namespaces()
-        store_urls = response.xpath('//url/loc/text()[contains(.,"/store/")]').extract()
-        for url in store_urls:
-            yield scrapy.Request(url, callback=self.parse_store)
-
-    def parse_store(self, response):
-        ref = re.search(r'.+/(.+?)/?(?:\.html|$)', response.url).group(1)
-
-        properties = {
-            'ref': ref,
-            'name': response.xpath('normalize-space(//div[@class="storetitle"][1]/text())').extract_first(),
-            'addr_full': response.xpath('normalize-space(//span[@id="store-address-info"]/p/a/text())').extract_first(),
-            'postcode': re.search(r'([\d-]*)$', response.xpath(
-                'normalize-space(//div[@class="store-details-text"][1]/p/text())').extract_first()).group(1),
-            'country': 'JP',
-            'lat': response.xpath('normalize-space(//input[@id="store-lat"]/@value)').extract_first(),
-            'lon': response.xpath('normalize-space(//input[@id="store-lon"]/@value)').extract_first(),
-            'phone': re.search(r'\s([\d-]*)$', response.xpath(
-                '//div[@id="store-tel"]/a/text()').extract_first()).group(1),
-            'website': response.url
-        }
-
-        yield GeojsonPointItem(**properties)
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for city in city_locations("JP", 10000):
+            yield JsonRequest(
+                url=f"https://www.dominos.jp/dynamicstoresearchapi/getstoresfromquery?lon={city['longitude']}&lat={city['latitude']}"
+            )

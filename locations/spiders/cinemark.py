@@ -1,46 +1,46 @@
-# -*- coding: utf-8 -*-
-import json
-import csv
-import re
+from typing import Any
 
-import scrapy
+import chompjs
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
 
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.pipelines.address_clean_up import merge_address_lines
+from locations.react_server_components import parse_rsc
 
-regex = r"(?<=Imagery\/Map\/Road\/)(-?\d+\.\d+),(-?\d+\.\d+)"
 
-class CinemarkSpider(scrapy.Spider):
+class CinemarkSpider(SitemapSpider):
     name = "cinemark"
-    item_attributes = {'brand': "Cinemark"}
+    item_attributes = {"brand": "Cinemark", "brand_wikidata": "Q707530"}
     allowed_domains = ["cinemark.com"]
-    start_urls = ["https://www.cinemark.com/full-theatre-list"]
+    sitemap_urls = ["https://www.cinemark.com/sitemap.xml"]
+    sitemap_rules = [(r"/theatres/[^/]+/[^/]+$", "parse")]
+    custom_settings = {"DOWNLOAD_DELAY": 10}  # Requested by robots.txt
 
-    def parse(self, response):
-        for theatre in response.css('div.theatres-by-state li a::attr(href)').getall():
-            yield scrapy.Request(response.urljoin(theatre), callback=self.parseTheatre)
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        scripts = response.xpath("//script[starts-with(text(), 'self.__next_f.push')]/text()").getall()
+        rsc = "".join(s for _, s in (chompjs.parse_js_object(script) for script in scripts) if isinstance(s, str))
+        location = self.find_theatre(dict(parse_rsc(rsc.encode())))
+        if not location or location["status"] == "Closed Permanently":
+            return
 
-    def parseTheatre(self, response):
-        lat = lon = None
-        geo = response.xpath('//*[@id="theatreInfo"]/div[1]/div[2]/a/img/@data-src').extract_first()
-        m = re.search(regex, geo)
-        if m:
-            lat, lon = m.group(1), m.group(2)
+        item = DictParser.parse(location)
+        item["ref"] = location["theaterId"]
+        item["name"] = location["theaterName"]
+        item["street_address"] = merge_address_lines([location["address1"], location["address2"]])
+        item["phone"] = location["officePhone"]
+        item["website"] = response.url
+        apply_category(Categories.CINEMA, item)
+        yield item
 
-        data = response.xpath('//body/script[@type="application/ld+json"]//text()').extract_first()
-        data = json.loads(data)
-
-        properties = {
-            'lat': lat,
-            'lon': lon,
-            'ref': data["@id"],
-            'name': data["name"],
-            'addr_full': data["address"][0]["streetAddress"],
-            'city': data["address"][0]["addressLocality"],
-            'state': data["address"][0]["addressRegion"],
-            'country': data["address"][0]["addressCountry"],
-            'postcode': data["address"][0]["postalCode"],
-            'phone': data.get("telephone"),
-            'website': data.get("url"),
-        }
-
-        yield GeojsonPointItem(**properties)
+    def find_theatre(self, node: Any) -> dict | None:
+        if isinstance(node, dict):
+            if "theaterId" in node and "latitude" in node:
+                return node
+            node = list(node.values())
+        if isinstance(node, list):
+            for value in node:
+                if theatre := self.find_theatre(value):
+                    return theatre
+        return None

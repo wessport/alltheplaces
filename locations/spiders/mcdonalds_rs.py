@@ -1,55 +1,52 @@
 import json
 import re
-import scrapy
-from scrapy.selector import Selector
-from locations.items import GeojsonPointItem
 
-class McDonaldsRSSpider(scrapy.Spider):
+import scrapy
+
+from locations.categories import Extras, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS_RS, OpeningHours
+from locations.spiders.mcdonalds import McdonaldsSpider
+from locations.spiders.mcdonalds_cz import Categories, apply_category
+
+SERVICES_MAPPING = {
+    "drive": Extras.DRIVE_THROUGH,
+    "wifi": Extras.WIFI,
+    "mcdelivery": Extras.DELIVERY,
+}
+
+
+class McdonaldsRSSpider(scrapy.Spider):
     name = "mcdonalds_rs"
-    item_attributes = { 'brand': "McDonald's" }
+    item_attributes = McdonaldsSpider.item_attributes
     allowed_domains = ["www.mcdonalds.rs"]
 
-    start_urls = (
-        'http://www.mcdonalds.rs/restoran-lokator/',
-    )
-
-    def normalize_item(self, data):
-        match = re.sub('<[^<]+?>', '', data)
-        return ' '.join(match.split())
-
-    def parse_postalCity(self, data):
-        match = re.search(r'(.*\d)(.*\w)', data[1])
-        if not match:
-            return "", ""
-        postalCode, city = match.groups()
-        return self.normalize_item(postalCode), self.normalize_item(city)
-
-    def parse_address(self, data):
-        data = Selector(text=data).xpath("//p//text()").extract()
-        address = self.normalize_item(data[0])
-        postalCode, city = self.parse_postalCity(data)
-        length = len(data)
-        return address, postalCode, city
+    start_urls = ["https://www.mcdonalds.rs/restorani/"]
 
     def parse(self, response):
-        try:
-            match = re.search(r'var locations = (.*)</script>', response.body_as_unicode())
-            data = json.loads(match.groups()[0])
-        except ValueError:
-            return
+        data = response.xpath('//script[contains(., "restaurantMarkers")]/text()').get()
+        match = re.search(r"var restaurantMarkers = (\[.*?\]);", data, re.DOTALL)
+        pois = json.loads(match.group(1))
 
-        for item in data:
-            address, postalCode, city = self.parse_address(item[3])
-            properties = {
-                'name': item[1],
-                'website': item[2],
-                'ref': item[0],
-                'lon': item[4],
-                'lat': item[5],
-                'city': city,
-                'addr_full': address,
-                'postcode': postalCode
-            }
+        for poi in pois:
+            poi["street-address"] = poi.pop("address")
+            item = DictParser.parse(poi)
 
-            yield GeojsonPointItem(**properties)
-            
+            for category in poi["categories"]:
+                if match := SERVICES_MAPPING.get(category):
+                    apply_yes_no(match, item, True)
+
+            opening_hours = re.sub(r"h<br />|H<br />|h|H", "", poi["restaurant_worktime"])
+            oh = OpeningHours()
+            oh.add_ranges_from_string(opening_hours, DAYS_RS)
+            item["opening_hours"] = oh
+
+            if "mccafe" in poi["categories"]:
+                mccafe = item.deepcopy()
+                mccafe["ref"] = "{}-mccafe".format(item["ref"])
+                mccafe["brand"] = "McCafé"
+                mccafe["brand_wikidata"] = "Q3114287"
+                apply_category(Categories.CAFE, mccafe)
+                yield mccafe
+
+            yield item

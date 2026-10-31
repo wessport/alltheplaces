@@ -1,97 +1,59 @@
-# -*- coding: utf-8 -*-
-import scrapy
-from locations.items import GeojsonPointItem
-import re
 import json
+import re
+from datetime import datetime
+from typing import Any
 
-regex_am = r"\s?([Aa][Mm])"
-regex_pm = r"\s?([Pp][Mm])"
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
 
-STATES = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DC", "DE", "FL", "GA",
-          "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-          "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-          "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-          "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"]
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import DAYS, OpeningHours
+from locations.items import SocialMedia, set_closed, set_social_media
+from locations.pipelines.address_clean_up import merge_address_lines
 
 
-class TacobuenoSpider(scrapy.Spider):
-    name = 'bueno'
-    item_attributes = { 'brand': "Taco Bueno" }
-    allowed_domains = ['buenoonthego.com']
-    download_delay = 0.1
-    start_urls = ["https://buenoonthego.com/mp/ndXTAL/searchByStateCode_JSON?"]
+class TacoBuenoSpider(Spider):
+    name = "taco_bueno"
+    item_attributes = {"brand": "Taco Bueno", "brand_wikidata": "Q7673958"}
+    start_urls = ["https://locations.tacobueno.com/"]
 
-    def start_requests(self):
-        for state in STATES:
-            store_url = self.start_urls[0] + 'stateCode=' + "'" + state + "'"
-            yield scrapy.Request(store_url, callback=self.parse)
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        yield JsonRequest(
+            url="https://locations.tacobueno.com/_next/data/{}/index.json".format(
+                re.search(r"buildId\"\s*:\s*\"(.+)\",", response.text).group(1)
+            ),
+            callback=self.parse_locations,
+        )
 
-    def convert_hours(self, hours):
-        converted_times = ''
-        if not hours:
-            return ''
+    def parse_locations(self, response: Response, **kwargs: Any) -> Any:
+        for location in json.loads(response.xpath('//*[contains(text(),"storeCode")]/text()').get())["props"][
+            "pageProps"
+        ]["locations"]:
+            item = DictParser.parse(location)
+            item["ref"] = location["storeCode"]
+            item["street_address"] = merge_address_lines(location["addressLines"])
+            item["website"] = item["website"].replace("\t", "")
+            item["phone"] = "; ".join(location["phoneNumbers"])
 
-        if hours != "Closed":
-            from_hr, to_hr = [hr.strip() for hr in hours.split('-')]
-            if re.search(regex_am, from_hr):
-                from_hr = re.sub(regex_am, '', from_hr)
-                hour_min = from_hr.split(':')
-                if len(hour_min[0]) < 2:
-                    hour_min[0].zfill(2)
-                converted_times += (":".join(hour_min)) + ' - '
-            else:
-                from_hr = re.sub(regex_pm, '', from_hr)
-                hour_min = from_hr.split(':')
-                if int(hour_min[0]) < 12:
-                    hour_min[0] = str(12 + int(hour_min[0]))
-                converted_times += (":".join(hour_min)) + ' - '
+            item["opening_hours"] = self.parse_opening_hours(location["businessHours"])
+            apply_category(Categories.FAST_FOOD, item)
 
-            if re.search(regex_am, to_hr):
-                to_hr = re.sub(regex_am, '', to_hr)
-                hour_min = to_hr.split(':')
-                if len(hour_min[0]) < 2:
-                    hour_min[0].zfill(2)
-                if int(hour_min[0]) == 12:
-                    hour_min[0] = '00'
-                converted_times += (":".join(hour_min))
-            else:
-                to_hr = re.sub(regex_pm, '', to_hr)
-                hour_min = to_hr.split(':')
-                if int(hour_min[0]) < 12:
-                    hour_min[0] = str(12 + int(hour_min[0]))
-                converted_times += (":".join(hour_min))
-        else:
-            converted_times += "off"
-        return converted_times
+            set_social_media(item, SocialMedia.FACEBOOK, location["attributes"].get("url_facebook"))
+            item["extras"]["website:menu"] = location["attributes"]["url_order_ahead"]
+            apply_yes_no(Extras.INDOOR_SEATING, item, location["attributes"]["serves_dine_in"] is True)
+            apply_yes_no(Extras.TAKEAWAY, item, location["attributes"]["has_takeout"] is True)
+            apply_yes_no(Extras.DRIVE_THROUGH, item, location["attributes"].get("has_drive_through") is True)
+            if hours := (location.get("otherHours") or {}).get("DRIVE_THROUGH"):
+                item["extras"]["opening_hours:drive_through"] = self.parse_opening_hours(hours).as_opening_hours()
+            item["extras"]["start_date"] = location["openingDate"]
+            if location["closingDate"]:
+                set_closed(item, datetime.fromisoformat(location["closingDate"]))
 
-    def parse(self, response):
-        results = json.loads(response.body_as_unicode())
-        if results:
-            for i in results:
-                ref = i['storeid']
-                name = i['restaurantname']
-                street = i['address1']
-                city = i['city']
-                state = i['statecode']
-                postcode = i['zipcode']
-                phone = i['phone']
-                lon = i['longitude']
-                lat = i['latitude']
-                hours = self.convert_hours(i['businesshours'])
-                addr_full = "{} {}, {} {}".format(
-                    street, city, state, postcode)
+            yield item
 
-                yield GeojsonPointItem(
-                    ref=ref,
-                    name=name,
-                    street=street,
-                    city=city,
-                    state=state,
-                    postcode=postcode,
-                    addr_full=addr_full,
-                    phone=phone,
-                    lon=lon,
-                    lat=lat,
-                    opening_hours=hours
-                )
-
+    def parse_opening_hours(self, hours: list) -> OpeningHours:
+        oh = OpeningHours()
+        for day, hours in zip(DAYS, hours):
+            oh.add_range(day, hours[0], hours[1])
+        return oh

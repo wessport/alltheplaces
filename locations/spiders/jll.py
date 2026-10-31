@@ -1,42 +1,38 @@
-# -*- coding: utf-8 -*-
-import json
 import re
+from typing import Any
 
-import scrapy
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.dict_parser import DictParser
 
 
-class JllSpider(scrapy.Spider):
+class JllSpider(Spider):
     name = "jll"
-    allowed_domains = ["jll.com"]
-    item_attributes = {'brand': 'JLL'}
+    item_attributes = {"brand": "JLL", "brand_wikidata": "Q1703389"}
+    start_urls = ["https://www.jll.com/en-in/locations?sort_by_relevance=relevance&location_page=1"]
+    custom_settings = {"ROBOTSTXT_OBEY": False}
 
-    def start_requests(self):
-        base_url = 'https://www.us.jll.com/bin/jll/search?q=locations&currentPage=/content/jll-dot-com/countries/amer/us/en/locations&top=100&p={page}&contentTypes=Location'
-        pages = ["1", "2", "3", "4"]
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        key_match = re.search(r"subscriptionIdentifier:\s*\"(.*)\",", response.text)
+        if not key_match:
+            self.logger.error("Could not find subscription key in response")
+            return
+        key = key_match.group(1)
+        yield JsonRequest(
+            url="https://www.jll.com/api/search/template",
+            headers={"subscription-key": key.strip()},
+            data={
+                "id": "jll_location_search_template_v3",
+                "params": {"size": 500, "from": 0, "countries": ["United States"], "language": "en-US"},
+            },
+            method="POST",
+            callback=self.parse_location,
+        )
 
-        for page in pages:
-            url = base_url.format(page=page)
-            yield scrapy.Request(url=url, callback=self.parse)
-
-    def parse(self, response):
-        data = json.loads(response.body_as_unicode())
-
-        for place in data["azureSearch"]["value"]:
-            properties = {
-                'ref': place["id"],
-                'name': place["title"],
-                'addr_full': place["streetAddress"],
-                'city': place["city"],
-                'state': place["stateProvince"],
-                'postcode': place["postalCode"],
-                'country': place["country"],
-                'lat': place["latitude"],
-                'lon': place["longitude"],
-                'phone': place["telephoneNumber"],
-                'website': place["cityPageLink"]
-            }
-
-            yield GeojsonPointItem(**properties)
+    def parse_location(self, response: Response, **kwargs: Any) -> Any:
+        for location in response.json()["hits"]["hits"]:
+            location.update(location.pop("_source"))
+            item = DictParser.parse(location)
+            item["ref"] = location["_id"]
+            yield item

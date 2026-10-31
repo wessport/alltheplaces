@@ -1,38 +1,35 @@
-import scrapy
-import json
-from locations.items import GeojsonPointItem
+from typing import AsyncIterator
 
-URL = 'https://www.nationalguard.com/api/state/'
+from geonamescache import GeonamesCache
+from scrapy import Spider
+from scrapy.http import Request
 
-US_STATES = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DC", "DE", "FL", "GA",
-             "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA",
-             "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY",
-             "NC", "ND", "OH", "OK", "OR", "PA", "USPR", "USGU", "USVI", "RI",
-             "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"]
+from locations.items import Feature
 
 
-class USArmyNationalGuardSpider(scrapy.Spider):
+class UsArmyNationalGuardSpider(Spider):
     name = "us_army_national_guard"
-    item_attributes = { 'brand': "US Army National Guard" }
-    allowed_domains = ["www.nationalguard.com"]
+    item_attributes = {
+        "brand": "US Army National Guard",
+        "brand_wikidata": "Q928670",
+        "country": "US",
+    }
+    allowed_domains = ["nationalguard.com"]
 
-    def start_requests(self):
-        for state in US_STATES:
-            url = ''.join([URL, state])
-            yield scrapy.Request(url, callback=self.parse_info)
+    async def start(self) -> AsyncIterator[Request]:
+        for state in GeonamesCache().get_us_states().keys() | ["USPR", "USGU", "USVI"]:
+            yield Request(url="https://nationalguard.com/api/state/" + state)
 
-    def parse_info(self, response):
-        data = json.loads(response.body_as_unicode())
+    def parse(self, response, **kwargs):
+        data = response.json()
         for row in data["locations"]:
             properties = {
-                'name': row["name"],
-                'ref': row["id"],
-                'addr_full': row["address"],
-                'state': row["state"],
-                'phone': row["phone"],
-                'lat': row["latitude"],
-                'lon': row["longitude"],
-
+                "name": row["name"],
+                "ref": row["id"],
+                "addr_full": row["address"],
+                "state": row["state"],
+                "phone": row["phone"],
+                "lat": row["latitude"],
+                "lon": row["longitude"],
             }
-
-            yield GeojsonPointItem(**properties)
+            yield Feature(**properties)

@@ -1,48 +1,32 @@
-# -*- coding: utf-8 -*-
 import json
-from urllib import parse
-import scrapy
-from locations.items import GeojsonPointItem
+
+from scrapy.spiders import SitemapSpider
+
+from locations.items import Feature
+from locations.pipelines.address_clean_up import merge_address_lines
 
 
-class VueCinemasSpider(scrapy.Spider):
+class VueCinemasSpider(SitemapSpider):
     name = "vue_cinemas"
-    item_attributes = { 'brand': "Vue Cinemas" }
-    start_urls = ("https://www.myvue.com/data/locations/",)
+    item_attributes = {"brand": "Vue", "brand_wikidata": "Q2535134"}
+    sitemap_urls = ["https://www.myvue.com/sitemap.xml"]
+    sitemap_rules = [(r"/whats-on$", "parse")]
+    requires_proxy = "GB"
 
-    def parse(self, response):
-        data = json.loads(response.body_as_unicode())
-        for letter in data["venues"]:
-            for cinema in letter["cinemas"]:
-                yield response.follow(
-                    f"https://www.myvue.com/cinema/{cinema['link_name']}/getting-here",
-                    self.parse_cinema,
-                )
+    def parse(self, response, **kwargs):
+        item = Feature()
+        jsondata = response.xpath("//script[@id='__NEXT_DATA__']/text()").get()
+        cinemadata = json.loads(jsondata)["props"]["pageProps"]["layoutData"]["sitecore"]["context"]["cinema"]
 
-    def parse_cinema(self, response):
-        cinema_name = response.xpath(
-            '//h2[@class="article-title gradient-fill"]/text()'
-        ).extract_first()
+        item["website"] = response.url.replace("/whats-on", "")
+        item["ref"] = item["website"].replace("https://www.myvue.com/cinema/", "")
+        item["name"] = "Vue Cinema"
+        item["branch"] = item["ref"].replace("-", " ").title()
+        if cinemadata:
+            item["lat"], item["lon"] = cinemadata["cinemaLocationCoordinates"]["value"].split(",")
+            item["addr_full"] = cinemadata["cinemaAddress"]["value"].replace("\n", ",")
+        else:
+            address_parts = response.xpath("//address/text()").getall()
+            item["addr_full"] = merge_address_lines(address_parts)
 
-        address_parts = response.xpath('//img[@alt="location-pin"]/../text()').extract()
-        if not address_parts:
-            address_parts = response.xpath(
-                f'//div[@class="collapse__heading" and @data-page-url="{parse.urlparse(response.url).path}"]/following-sibling::div//div[@class="container container--scroll"]/div/p/text()'
-            ).extract()
-        address_parts = [a.strip() for a in address_parts if a.strip()]
-
-        maps_link = response.xpath('//a[text()="Get directions"]/@href').extract_first()
-        query_string = parse.urlparse(maps_link).query
-        query_dict = parse.parse_qs(query_string)
-        coords = query_dict["q"][0].split(",")
-
-        properties = {
-            "ref": response.url.split("/")[4],
-            "name": cinema_name,
-            "addr_full": ", ".join(address_parts),
-            "postcode": address_parts[-1],
-            "lat": float(coords[0]),
-            "lon": float(coords[1]),
-            "website": response.url.replace("/getting-here", ""),
-        }
-        yield GeojsonPointItem(**properties)
+        yield item

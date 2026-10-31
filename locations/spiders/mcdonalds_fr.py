@@ -1,94 +1,38 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-import re
-from locations.items import GeojsonPointItem
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.spiders.mcdonalds import McdonaldsSpider
+from locations.storefinders.woosmap import WoosmapSpider
 
 
-class McDonalsFRSpider(scrapy.Spider):
-
+class McdonaldsFRSpider(WoosmapSpider):
     name = "mcdonalds_fr"
-    item_attributes = { 'brand': "McDonald's" }
-    allowed_domains = ["www.mcdonalds.fr"]
-    start_urls = (
-        'https://prod-dot-mcdonaldsfrance-storelocator.appspot.com/api/store/nearest?center=2.331052600000021:48.8640493&limit=1000&authToken=26938DBF9169A7F39C92BDCF1BA7A&db=prod',
-        'https://prod-dot-mcdonaldsfrance-storelocator.appspot.com/api/store/nearest?center=2.6830176999999367:45.2304368&limit=1000&authToken=26938DBF9169A7F39C92BDCF1BA7A&db=prod',
-    )
+    item_attributes = McdonaldsSpider.item_attributes
+    key = "woos-77bec2e5-8f40-35ba-b483-67df0d5401be"
+    origin = "https://www.mcdonalds.fr"
 
-    def store_hours(self, data):
-        day_groups = []
-        this_day_group = {}
-        weekdays = ['Su', 'Mo', 'Th', 'We', 'Tu', 'Fr', 'Sa']
-        for day_hour in data:
-            if day_hour['idx'] > 7:
-                continue
+    def parse_item(self, item, feature, **kwargs):
+        item["website"] = (
+            f'https://www.mcdonalds.fr/restaurants{feature["properties"]["contact"]["website"]}/{feature["properties"]["store_id"]}'
+        )
+        item["postcode"] = feature["properties"]["user_properties"]["displayPostCode"]
+        item["extras"]["check_date"] = feature["properties"]["last_updated"]
+        item["branch"] = item.pop("name").title()
 
-            hours = ''
-            start, end = day_hour['value'].split("-")[0].strip(), day_hour['value'].split("-")[1].strip()
+        apply_yes_no(Extras.DELIVERY, item, "mcdelivery" in feature["properties"]["tags"])
+        apply_yes_no(Extras.DRIVE_THROUGH, item, "mcdrive" in feature["properties"]["tags"])
+        apply_yes_no(Extras.INDOOR_SEATING, item, "table-service" in feature["properties"]["tags"])
+        apply_yes_no(Extras.TAKEAWAY, item, "take-away" in feature["properties"]["tags"])
+        apply_yes_no(Extras.SELF_CHECKOUT, item, "terminal" in feature["properties"]["tags"])
+        apply_yes_no(Extras.OUTDOOR_SEATING, item, "terrace" in feature["properties"]["tags"])
+        apply_yes_no(Extras.WIFI, item, "wireless" in feature["properties"]["tags"])
 
-            short_day = weekdays[day_hour['idx'] - 1]
-            hours = '{}:{}-{}:{}'.format(start[:2], start[3:], end[:2], end[3:])
-            if not this_day_group:
-                this_day_group = {
-                    'from_day': short_day,
-                    'to_day': short_day,
-                    'hours': hours,
-                }
+        if "mccafe" in feature["properties"]["tags"]:
+            mccafe = item.deepcopy()
+            mccafe["ref"] = "{}-mccafe".format(item["ref"])
+            mccafe["brand"] = "McCafé"
+            mccafe["brand_wikidata"] = "Q3114287"
+            apply_category(Categories.CAFE, mccafe)
+            yield mccafe
 
-            elif hours == this_day_group['hours']:
-                this_day_group['to_day'] = short_day
+        apply_category(Categories.FAST_FOOD, item)
 
-            elif hours != this_day_group['hours']:
-                day_groups.append(this_day_group)
-                this_day_group = {
-                    'from_day': short_day,
-                    'to_day': short_day,
-                    'hours': hours,
-                }
-
-        day_groups.append(this_day_group)
-
-        if not day_groups:
-            return None
-        opening_hours = ''
-        if len(day_groups) == 1 and not day_groups[0]:
-            return None
-        if len(day_groups) == 1 and day_groups[0]['hours'] in ('00:00-23:59', '00:00-00:00'):
-            opening_hours = '24/7'
-        else:
-            for day_group in day_groups:
-                if day_group['from_day'] == day_group['to_day']:
-                    opening_hours += '{from_day} {hours}; '.format(**day_group)
-                else:
-                    opening_hours += '{from_day}-{to_day} {hours}; '.format(**day_group)
-            opening_hours = opening_hours [:-2]
-
-        return opening_hours
-
-    def parse(self, response):
-        match = re.search(r'(HTTPResponseLoaded\()({.*})(\))', response.body_as_unicode())
-        if not match:
-            return
-
-        results = json.loads(match.groups()[1])
-        results = results["poiList"]
-        for item in results:
-            data = item["poi"]
-            properties = {
-                'city': data['location']['city'],
-                'ref': data['id'],
-                'addr_full': data['location']['streetLabel'],
-                'phone': data['datasheet']['tel']['number'],
-                'state': data['location']['countryISO'],
-                'postcode': data['location']['postalCode'],
-                'name': data['name'],
-                'lat': data['location']['coords']['lat'],
-                'lon': data['location']['coords']['lon'],
-                'website': 'https://www.restaurants.mcdonalds.fr' + data['datasheet']['web']
-            }
-
-            opening_hours = self.store_hours(data['datasheet']['descList'])
-            if opening_hours:
-                properties['opening_hours'] = opening_hours
-
-            yield GeojsonPointItem(**properties)
+        yield item

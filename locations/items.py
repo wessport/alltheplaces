@@ -1,28 +1,342 @@
-# -*- coding: utf-8 -*-
-
 # Define here the models for your scraped items
 #
 # See documentation in:
 # http://doc.scrapy.org/en/latest/topics/items.html
+import logging
+from datetime import datetime
+from enum import Enum
+from typing import Any, Iterable
 
+import pycountry
 import scrapy
 
+from locations.hours import OpeningHours
 
-class GeojsonPointItem(scrapy.Item):
+logger = logging.getLogger(__name__)
+
+
+class Feature(scrapy.Item):
     lat = scrapy.Field()
     lon = scrapy.Field()
+    geometry = scrapy.Field()
     name = scrapy.Field()
+    branch = scrapy.Field()
     addr_full = scrapy.Field()
+    unit = scrapy.Field()
     housenumber = scrapy.Field()
     street = scrapy.Field()
+    street_address = scrapy.Field()
     city = scrapy.Field()
     state = scrapy.Field()
     postcode = scrapy.Field()
     country = scrapy.Field()
     phone = scrapy.Field()
+    email = scrapy.Field()
     website = scrapy.Field()
+    twitter = scrapy.Field()
+    facebook = scrapy.Field()
     opening_hours = scrapy.Field()
+    image = scrapy.Field()
     ref = scrapy.Field()
     brand = scrapy.Field()
     brand_wikidata = scrapy.Field()
+    operator = scrapy.Field()
+    operator_wikidata = scrapy.Field()
+    network = scrapy.Field()
+    network_wikidata = scrapy.Field()
+    located_in = scrapy.Field()
+    located_in_wikidata = scrapy.Field()
+    nsi_id = scrapy.Field()
     extras = scrapy.Field()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self._values.get("extras"):
+            self.__setitem__("extras", {})
+
+    def set_tag(self, key: str, value: str):
+        if key in Feature.fields.keys():
+            self[key] = value
+        else:
+            self["extras"][key] = value
+
+    def get_tag(self, key: str) -> Any:
+        if key in Feature.fields.keys():
+            return self.get(key)
+        else:
+            return self["extras"].get(key)
+
+    def has_valid_country_code(self) -> bool:
+        """
+        Determine if the feature's country is a valid ISO 3166-1 alpha-2 code.
+
+        :return: True or False for whether the feature's country is a valid
+                 ISO 3166-1 alpha-2 code.
+        """
+        if not self.get("country"):
+            return False
+        if self["country"] not in [country.alpha_2 for country in pycountry.countries]:
+            return False
+        return True
+
+    def get_iso_3166_2_code(self) -> str | None:
+        """
+        Return an ISO 3166-2 code (both first and second parts combined with
+        a hyphen joining the parts) if the feature has a valid ISO 3166-2
+        country and state defined. Otherwise return None.
+
+        :return: ISO 3166-2 code or None if a code cannot be generated for
+                 the feature's defined country and state.
+        """
+        if not self.get("country"):
+            return None
+        if not self.get("state"):
+            return None
+        if not self.has_valid_country_code():
+            return None
+        for subdivision in pycountry.subdivisions.get(country_code=self["country"]):
+            if self["state"] in [subdivision.code.split("-", 1)[1], subdivision.name]:
+                return subdivision.code
+        return None
+
+
+def get_lat_lon(item: Feature) -> tuple[float, float] | None:
+    """
+    Retrieve the latitude and longitude from a Feature if they are defined and
+    if they are in a valid format which can be converted to floating point
+    numbers. Preference is given to a Point object in the "geometry" field and
+    if this "geometry" field is not defined, the "lat" and "lon" fields are
+    used instead for extracting a latitude and longitude.
+
+    If the "geometry" field is not valid Point geometry, or the "lat" and "lon"
+    fields are invalid or not defined, this function will return None. Valid
+    latitudes are between -90.0 and 90.0 and valid longitudes are between
+    -180.0 and 180.0.
+
+    :param item: Feature which may or may not have valid geometry defined.
+    :return: tuple of two floating point numbers for latitude and longitude
+             respectively, or None if no valid geometry is defined.
+    """
+    lat_untyped = None
+    lon_untyped = None
+    if geometry := item.get("geometry"):
+        if isinstance(geometry, dict):
+            if geometry.get("type") == "Point":
+                if coords := geometry.get("coordinates"):
+                    if isinstance(coords, list):
+                        if len(coords) == 2:
+                            lat_untyped = coords[1]
+                            lon_untyped = coords[0]
+    else:
+        lat_untyped = item.get("lat")
+        lon_untyped = item.get("lon")
+    if lat_untyped is None or lon_untyped is None:
+        return None
+    try:
+        lat_typed = float(lat_untyped)
+        lon_typed = float(lon_untyped)
+    except (TypeError, ValueError):
+        return None
+    if lat_typed < -90.0 or lat_typed > 90.0 or lon_typed < -180.0 or lon_typed > 180.0:
+        return None
+    return (lat_typed, lon_typed)
+
+
+def set_lat_lon(item: Feature, lat: float, lon: float) -> None:
+    """
+    Adds or overwrites Point geometry on a Feature from supplied
+    floating point latitude and longitude values. If the supplied latitude is
+    invalid (outside of range -90.0 to 90.0) or the supplied longitude is
+    invalid then this function does not do anything.
+
+    :param item: Feature to add Point geometry to.
+    :param lat: floating point latitude with value between -90.0 and 90.0.
+    :param lon: floating point longitude with value between -180.0 and 180.0.
+    """
+    if not isinstance(lat, float) or not isinstance(lon, float):
+        return
+    if lat < -90.0 or lat > 90.0 or lon < -180.0 or lon > 180.0:
+        return
+    item.pop("lat", None)
+    item.pop("lon", None)
+    item["geometry"] = {
+        "type": "Point",
+        "coordinates": [lon, lat],
+    }
+
+
+class SocialMedia(Enum):
+    FACEBOOK = "facebook"
+    INSTAGRAM = "instagram"
+    LINKEDIN = "linkedin"
+    MASTODON = "mastodon"
+    PINTEREST = "pinterest"
+    SNAPCHAT = "snapchat"
+    TELEGRAM = "telegram"
+    TIKTOK = "tiktok"
+    TRIPADVISOR = "tripadvisor"
+    TRIP_ADVISOR = TRIPADVISOR
+    TWITTER = "twitter"
+    VIBER = "viber"
+    VK = "vk"
+    WHATSAPP = "whatsapp"
+    YELP = "yelp"
+    YOUTUBE = "youtube"
+
+
+def get_social_media(item: Feature, service: str | Enum) -> str:
+    if isinstance(service, Enum):
+        service_str = service.value
+    elif isinstance(service, str):
+        service_str = service.lower()
+    else:
+        raise TypeError("string or Enum required")
+
+    if service_str in item.fields:
+        return str(item.get(service_str))
+    else:
+        return str(item["extras"].get("contact:{}".format(service_str)))
+
+
+def set_social_media(item: Feature, service: str | Enum, account: str) -> None:
+    if isinstance(service, Enum):
+        service_str = service.value
+    elif isinstance(service, str):
+        service_str = service.lower()
+    else:
+        raise TypeError("string or Enum required")
+
+    if service_str in item.fields:
+        item[service_str] = account
+    else:
+        item["extras"]["contact:{}".format(service_str)] = account
+
+
+def set_closed(item: Feature, end_date: datetime | None = None) -> None:
+    item["extras"]["end_date"] = end_date.strftime("%Y-%m-%d") if end_date else "yes"
+
+
+def merge_items(language_dict: dict, main_language: str, matching_key: str = "ref") -> Iterable[Feature]:
+    """
+    Merge multiple items in different languages together. See starbucks_cn for example usage.
+    :param language_dict: a dict of language to a dict of keys to items for all of the languages/items to be merged.
+    :param main_language: the language to be used for the main keys in the item.
+    :param matching_key: the key (defaults to "ref") that is used to match up items from different languages.
+    :return: individual merged items
+    """
+    all_item_refs = {language: [ref for ref in items.keys()] for language, items in language_dict.items()}
+    for item in language_dict[main_language].values():
+        matched_items = {}
+        for language, items in language_dict.items():
+            if item[matching_key] in items.keys():
+                matched_items[language] = items[item[matching_key]]
+                all_item_refs[language].remove(item[matching_key])
+            else:
+                logger.warning(
+                    f"No matches found for '{matching_key}': '{item[matching_key]}' in language '{language}'"
+                )
+
+        item = get_merged_item(matched_items, main_language)
+        yield item
+    for language, refs in all_item_refs.items():
+        if len(refs) > 0:
+            logger.warning(f"Failed to match {len(refs)} for language: {language}")
+        for ref in refs:
+            yield language_dict[language][ref]
+
+
+KEYS_THAT_SHOULD_MATCH = [
+    "lat",
+    "lon",
+    "geometry",
+    "housenumber",
+    "postcode",
+    "country",
+    "image",
+    "ref",
+    "brand",
+    "brand_wikidata",
+    "operator",
+    "operator_wikidata",
+    "network",
+    "network_wikidata",
+    "located_in",
+    "located_in_wikidata",
+    "nsi_id",
+]
+
+TRANSLATABLE_EXTRA_KEYS = [
+    "alt_name",
+    "wheelchair:description",
+]
+
+TRANSLATABLE_PREFIXES = [
+    "website",
+    "contact",
+]
+
+
+def get_merged_item(matched_items: dict, main_language: str) -> dict:
+    """
+    Merge items in different languages, but which are the same feature, together.
+    :param matched_items: a dict of language to item for all of the languages/items to be merged.
+    :param main_language: the language to be used for the main keys in the item.
+    :return: a single merged item
+    """
+    # Do extras first before we add language keys to it
+    item = get_merged_extras(matched_items, main_language)
+
+    all_keys = set([key for match in matched_items.values() for key in match.keys()])
+    for key, value in {key: item.get(key) for key in all_keys}.items():
+        if key == "extras":
+            continue
+        if all([value == match.get(key) for match in matched_items.values()]):
+            continue
+        if key == "addr_full":
+            for language, match in matched_items.items():
+                item["extras"]["addr:full:" + language] = match.get(key)
+        elif key in ["city", "postcode", "state", "street", "street_address"]:
+            for language, match in matched_items.items():
+                item["extras"][f"addr:{key}:{language}"] = match.get(key)
+        elif key == "opening_hours":
+            if isinstance(value, OpeningHours):
+                item_oh = value.as_opening_hours()
+            else:
+                item_oh = value
+            match_oh_list = []
+            for match in matched_items.values():
+                if isinstance(match["opening_hours"], OpeningHours):
+                    match_oh_list.append(match["opening_hours"].as_opening_hours())
+                else:
+                    match_oh_list.append(match["opening_hours"])
+            if not all([match_oh == item_oh for match_oh in match_oh_list]):
+                logger.warning(
+                    f"Opening hours do not match in all items for ref: {item['ref']}, using hours from '{main_language}'"
+                )
+        elif key == "phone":
+            matched_phones = [match["phone"] for match in matched_items.values()]
+            if not all([value == matched_phone for matched_phone in matched_phones]):
+                logger.info(f"Phone numbers do not all match, returning all numbers for ref: {item['ref']}")
+                item["phone"] = "; ".join(matched_phones)
+        else:
+            if key in KEYS_THAT_SHOULD_MATCH:
+                logger.warning(f"Key '{key}' does not match in all items for ref: {item['ref']}")
+            for language, match in matched_items.items():
+                item["extras"][f"{key}:{language}"] = match.get(key)
+    return item
+
+
+def get_merged_extras(matched_items: dict, main_language: str) -> dict:
+    item = matched_items[main_language]
+    extras_keys = set([key for match in matched_items.values() for key in match["extras"].keys()])
+    for extras_key, extras_value in {key: item["extras"].get(key) for key in extras_keys}.items():
+        if all([extras_value == match["extras"].get(extras_key) for match in matched_items.values()]):
+            continue
+        if extras_key in TRANSLATABLE_EXTRA_KEYS:
+            for language, match in matched_items.items():
+                item["extras"][f"{extras_key}:{language}"] = match["extras"].get(extras_key)
+        for prefix in TRANSLATABLE_PREFIXES:
+            if extras_key.startswith(prefix):
+                for language, match in matched_items.items():
+                    item["extras"][f"{extras_key}:{language}"] = match["extras"].get(extras_key)
+    return item

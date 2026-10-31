@@ -1,39 +1,48 @@
-# -*- coding: utf-8 -*-
-import json
+from typing import Any, AsyncIterator
+from urllib.parse import urljoin
 
-import scrapy
-from locations.items import GeojsonPointItem
+from scrapy import Spider
+from scrapy.http import Request, Response
 
-class EquinoxSpider(scrapy.Spider):
+from locations.items import Feature
+from locations.user_agents import BROWSER_DEFAULT
+
+
+class EquinoxSpider(Spider):
     name = "equinox"
+    item_attributes = {"brand": "Equinox", "brand_wikidata": "Q5384535"}
     allowed_domains = ["cdn.contentful.com"]
-    start_url = (
-        'https://cdn.contentful.com/spaces/drib7o8rcbyf/environments/master/entries?content_type=club&include=3'
-    )
+    start_url = "https://cdn.contentful.com/spaces/drib7o8rcbyf/environments/master/entries?content_type=club&include=3"
+    custom_settings = {"USER_AGENT": BROWSER_DEFAULT}
 
-    headers = {"Authorization": "Bearer jQC0m25d6MdSBGuBMFANzxpuWt5O_sdQOIYfLpqxcAI",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:81.0) Gecko/20100101 Firefox/81.0",
-    "X-Contentful-User-Agent": "sdk contentful.js/0.0.0-determined-by-semantic-release; platform browser; os Windows;",
-    "Origin": "https://www.equinox.com"
+    headers = {
+        "Authorization": "Bearer jQC0m25d6MdSBGuBMFANzxpuWt5O_sdQOIYfLpqxcAI",
+        "X-Contentful-User-Agent": "sdk contentful.js/0.0.0-determined-by-semantic-release; platform browser; os Windows;",
+        "Origin": "https://www.equinox.com",
     }
-    def start_requests(self):
 
-        yield scrapy.Request(self.start_url, callback=self.parse, headers=self.headers, meta={"skip": 0})
+    async def start(self) -> AsyncIterator[Request]:
+        yield Request(self.start_url, callback=self.parse, headers=self.headers, meta={"skip": 0})
 
-    def parse(self, response):
-        data = json.loads(response.text)
-        for item in data['items']:
-            fields = item['fields']
-            yield GeojsonPointItem(name=fields['name'],
-                                   addr_full=fields['address'],
-                                   city=fields['city'],
-                                   state=fields['state'],
-                                   postcode=fields['zip'],
-                                   country=fields['country'],
-                                   phone=fields['phoneNumber'],
-                                   ref=fields['facilityId'],
-                                   website=response.urljoin(fields['clubDetailPageURL'])
-                                   )
-        records_read = data['skip'] + data['limit']
-        if records_read < data['total']:
-            yield scrapy.Request(f"{self.start_url}&skip={records_read}", callback=self.parse, headers=self.headers)
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        data = response.json()
+        for item in data["items"]:
+            fields = item["fields"]
+            yield Feature(
+                branch=fields["name"].removeprefix("Equinox "),
+                street_address=fields["address"],
+                city=fields["city"],
+                state=fields["state"],
+                postcode=fields["zip"],
+                country=fields["country"],
+                phone=fields["phoneNumber"],
+                ref=fields["facilityId"],
+                website=urljoin("https://www.equinox.com/", fields["clubDetailPageURL"]),
+            )
+        records_read = data["skip"] + data["limit"]
+        if records_read < data["total"]:
+            yield Request(
+                f"{self.start_url}&skip={records_read}",
+                callback=self.parse,
+                headers=self.headers,
+            )

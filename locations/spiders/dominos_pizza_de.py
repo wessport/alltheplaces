@@ -1,49 +1,41 @@
-# -*- coding: utf-8 -*-
 import re
-import scrapy
+from typing import Any, Iterable
 
-from locations.items import GeojsonPointItem
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
+
+from locations.items import Feature
+from locations.pipelines.address_clean_up import clean_address
+from locations.user_agents import BROWSER_DEFAULT
 
 
-class DomionsPizzaWorldwideSpider(scrapy.Spider):
+class DominosPizzaDESpider(SitemapSpider):
     name = "dominos_pizza_de"
-    item_attributes = {'brand': "Dominos Pizza Germany"}
+    item_attributes = {"brand": "Domino's", "brand_wikidata": "Q839466"}
     allowed_domains = ["dominos.de"]
+    sitemap_urls = ["https://www.dominos.de/sitemap.aspx"]
+    url_regex = r"https://www\.dominos\.de/+filiale/+[\w]+-[\w]+-([\d]+)$"
+    sitemap_rules = [(url_regex, "parse_store")]
+    custom_settings = {"DOWNLOAD_TIMEOUT": 180, "USER_AGENT": BROWSER_DEFAULT}
 
-    start_urls = (
-        'https://www.dominos.de/store',
-    )
+    def sitemap_filter(self, entries: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+        for entry in entries:
+            entry["loc"] = re.sub(r"(\w)/+", r"\1/", entry["loc"])  # clean url pattern filiale//
+            yield entry
 
-    def parse(self,response):
-        store_urls = response.xpath('//link[@rel="canonical"]/@href').extract()
-        for store_url in store_urls:
-            yield scrapy.Request(response.urljoin(store_url), callback=self.parse_region)
-
-
-    def parse_region(self, response):
-        regions = response.xpath('//ul[@id="region-links"]/li/a/@href').extract()
-        for region in regions:
-            yield scrapy.Request(response.urljoin(region), callback=self.parse_locality)
-
-    def parse_locality(self, response):
-        stores = response.xpath('//div[@class="store-information"]/h4/a/@href').extract()
-        for store in stores:
-            yield scrapy.Request(response.urljoin(store), callback=self.parse_store)
-
-    def parse_store(self, response):
-        ref = re.search(r'.+-(.+?)/?(?:\.html|$)', response.url).group(1)
-        country = re.search(r'\.([a-z]{2})\/', response.url).group(1)
-        address_data = response.xpath('//a[@id="open-map-address"]/text()').extract()
-        locality_data = address_data[1].strip()
+    def parse_store(self, response: Response) -> Any:
+        address_data = response.xpath('//a[@id="open-map-address"]/text()').getall()
         properties = {
-            'ref': ref.strip('/'),
-            'name': response.xpath('//h1[@class="storetitle"]/text()').extract_first(),
-            'addr_full': address_data[0].strip().strip(','),
-            'city': re.search(r'(.*) (.*[A-Za-z])', locality_data).group(2),
-            'postcode': re.search(r'(.*) (.*[A-Za-z])', locality_data).group(1),
-            'country': country,
-            'lat': float(response.xpath('//div[@class="store-details-info"]/div[1]/input[1]/@value').extract_first().replace(",", ".")),
-            'lon': float(response.xpath('//div[@class="store-details-info"]/div[1]/input[2]/@value').extract_first().replace(",", ".")),
-            'website': response.url
+            "ref": re.match(self.url_regex, response.url).group(1),
+            "branch": response.xpath('//*[@class="storetitle"]/text()').get("").removeprefix("Domino's Pizza "),
+            "street_address": clean_address(address_data[0].strip().strip(",")),
+            "lat": response.xpath('//input[@id="store-lat"]/@value').get().replace(",", "."),
+            "lon": response.xpath('//input[@id="store-lon"]/@value').get().replace(",", "."),
+            "phone": response.xpath('//a[contains(@href, "tel:")]/@href').get(),
+            "website": response.url,
         }
-        yield GeojsonPointItem(**properties)
+        if locality_data := re.match(r"([\d]+)? ?([-\ \w'À-Ÿ()]+)$", address_data[1].strip()):
+            properties["city"] = locality_data.group(2)
+            properties["postcode"] = locality_data.group(1)
+
+        yield Feature(**properties)

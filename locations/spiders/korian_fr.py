@@ -1,47 +1,27 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from typing import Iterable
 
-import scrapy
+from scrapy.http import TextResponse
+from scrapy.linkextractors import LinkExtractor
+from scrapy.spiders import CrawlSpider, Rule
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.structured_data_spider import StructuredDataSpider
 
 
-class KorianFrSpider(scrapy.Spider):
+class KorianFRSpider(CrawlSpider, StructuredDataSpider):
     name = "korian_fr"
-    item_attributes = {'brand': "Korian"}
-    allowed_domains = ['api-www.korian.fr']
+    item_attributes = {"operator": "Korian", "operator_wikidata": "Q3198944"}
+    start_urls = ["https://www.korian.fr/maisons-retraite"]
+    rules = [
+        Rule(
+            LinkExtractor(allow=r"https://www.korian.fr/maisons-retraite/[-\w]+/[-\w]+/[-\w]+/[-\w]+$"),
+            callback="parse_sd",
+        )
+    ]
+    requires_proxy = True
 
-    def start_requests(self):
-        types = ['maison-retraite', 'clinique-ssr', 'residence-seniors', 'hospitalisation-a-domicile']
-
-        regions = ['bretagne', 'occitanie', 'ile-de-france', 'normandie', 'auvergne-rhone-alpes',
-                   'nouvelle-aquitaine', 'hauts-de-france', 'provence-alpes-cote-dazur', 'centre-val-de-loire',
-                   'pays-de-la-loire', 'bourgogne-franche-comte', 'grand-est']
-
-        for type in types:
-            for region in regions:
-                url = 'https://api-www.korian.fr/api-front/FR/{type}/{region}'.format(type=type, region=region)
-                yield scrapy.Request(url=url, callback=self.parse)
-
-    def parse(self, response):
-        result = json.loads(response.body_as_unicode())
-
-        stores = result["data"]["content"][0]["results"]
-
-        for store in stores:
-            properties = {
-                'ref': store["id"],
-                'name': store["name"],
-                'addr_full': store["address"],
-                'city': store["city"],
-                'state': store["region"],
-                'postcode': store["zipcode"],
-                'country': "FR",
-                'lat': store["latitude"],
-                'lon': store["longitude"],
-                'website': 'https://www.korian.fr/' + store["redirecturl"]
-            }
-
-            yield GeojsonPointItem(**properties)
+    def post_process_item(self, item: Feature, response: TextResponse, ld_data: dict, **kwargs) -> Iterable[Feature]:
+        item["name"] = item["name"].removeprefix("Korian ")
+        apply_category(Categories.SOCIAL_FACILITY, item)
+        yield item

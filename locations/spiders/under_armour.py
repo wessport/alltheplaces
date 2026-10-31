@@ -1,66 +1,74 @@
-# -*- coding: utf-8 -*-
-import json
-import re
+from typing import Any, AsyncIterator
 
-import scrapy
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
 
-from locations.items import GeojsonPointItem
-from locations.hours import OpeningHours
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+from locations.hours import DAYS_FULL, OpeningHours
+from locations.pipelines.address_clean_up import merge_address_lines
+from locations.user_agents import BOT_USER_AGENT_REQUESTS
 
 
-class UnderArmourSpider(scrapy.Spider):
+class UnderArmourSpider(Spider):
     name = "under_armour"
-    item_attributes = {'brand': "Under Armour"}
-    allowed_domains = ["where2getit.com"]
+    item_attributes = {"brand": "Under Armour", "brand_wikidata": "Q2031485"}
+    allowed_domains = ["store-locator.underarmour.com"]
 
-    def start_requests(self):
-        url = "https://hosted.where2getit.com/underarmour/2015/rest/locatorsearch?like=0.8625979438724998&lang=en_US"
+    async def start(self) -> AsyncIterator[Any]:
+        yield JsonRequest(
+            url="https://store-locator.underarmour.com/api/stores/nearby/?lat=0&lng=0&radius=50000",
+            headers={"User-Agent": BOT_USER_AGENT_REQUESTS},
+        )
 
-        headers = {
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Origin': 'https://hosted.where2getit.com',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Referer': 'https://hosted.where2getit.com/underarmour/2015/index1.html',
-            'Connection': 'keep-alive',
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.193 Safari/537.36'
-        }
+    def parse(self, response: Response, **kwargs: Any):
+        for store in response.json()["stores"]:
+            if store.get("store_type") == "Dealer":
+                continue
+            if store.get("openInfo") == "CLOSED_PERMANENTLY":
+                continue
 
-        form_data = {"request": {"appkey": "24358678-428E-11E4-8BC2-2736C403F339",
-                                 "formdata": {"geoip": "false", "dataview": "store_default",
-                                              "order": "UASPECIALITY, UAOUTLET, AUTHORIZEDDEALER, rank,_distance",
-                                              "limit": "5000", "geolocs": {"geoloc": [
-                                         {"addressline": "New York", "country": "US",
-                                          "latitude": "40.7127753", "longitude": "-74.0059728",
-                                          "state": "NY",
-                                          "province": "", "city": "New York", "address1": "", "postalcode": ""}]},
-                                              "searchradius": "5000",
-                                              "where": {"or": {"UASPECIALITY": {"eq": "1"}, "UAOUTLET": {"eq": "1"},
-                                                               "AUTHORIZEDDEALER": {"eq": ""}}}, "false": "0"}}}
+            item = DictParser.parse(store)
+            item["branch"] = (
+                item.pop("name").removeprefix("UNDER ARMOUR ").removeprefix("Under Armour ").removeprefix("UA ")
+            )
+            if item["branch"].startswith("BRAND HOUSE ") or item["branch"].startswith("Brand House "):
+                item["name"] = "Under Armour Brand House"
+                item["branch"] = item["branch"][12:].strip("- ")
+            elif "Factory House" in item["branch"]:
+                item["name"] = "Under Armour Factory House"
+                item["branch"] = item["branch"].replace("Factory House", "").strip(" |-")
+            else:
+                item["name"] = "Under Armour"
+                item["branch"] = item["branch"].strip("- ")
+            item["street"] = None
+            item["street_address"] = merge_address_lines(
+                [store["address"].get("street"), store["address"].get("street2")]
+            )
+            item["website"] = f"https://store-locator.underarmour.com/en-us/store/{store['id']}/"
 
-        yield scrapy.http.FormRequest(url=url, method='POST',
-                                      body=json.dumps(form_data), headers=headers,
-                                      callback=self.parse)
+            self._parse_hours(item, store)
 
-    def parse(self, response):
-        data = json.loads(response.body_as_unicode())
+            apply_category(Categories.SHOP_CLOTHES, item)
+            yield item
 
-        for store in data["response"]["collection"]:
-            properties = {
-                'ref': store["clientkey"],
-                'name': store["subname"],
-                'addr_full': store["address1"],
-                'city': store["city"],
-                'state': store["state"],
-                'postcode': store["postalcode"],
-                'country': store["country"],
-                'lat': store["latitude"],
-                'lon': store["longitude"],
-                'phone': store["phone"],
-                'extras': {
-                    'location_type': store["name"]
-                }
-            }
-
-            yield GeojsonPointItem(**properties)
+    def _parse_hours(self, item, store: dict):
+        hours = store.get("hours", {})
+        if not hours:
+            return
+        try:
+            oh = OpeningHours()
+            fail_count = 0
+            for day in DAYS_FULL:
+                value = hours.get(day.lower(), "")
+                if not value or value == "Closed":
+                    continue
+                try:
+                    oh.add_ranges_from_string(f"{day} {value}")
+                except Exception:
+                    fail_count += 1
+                    if fail_count >= 3:
+                        break
+            item["opening_hours"] = oh
+        except Exception:
+            self.crawler.stats.inc_value("atp/hours/failed")

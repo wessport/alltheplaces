@@ -1,0 +1,44 @@
+from h2.exceptions import ProtocolError
+from scrapy.http import Response
+from scrapy.settings.default_settings import RETRY_EXCEPTIONS
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.structured_data_spider import StructuredDataSpider
+from locations.user_agents import FIREFOX_LATEST
+
+
+class NettoDESpider(SitemapSpider, StructuredDataSpider):
+    name = "netto_de"
+    allowed_domains = ["netto-online.de"]
+    item_attributes = {"brand_wikidata": "Q879858"}
+    sitemap_urls = ["https://www.netto-online.de/ueber-netto/sitemap/index"]
+    sitemap_rules = [(r"/filialen/[^/]+/[^/]+/(\d+)$", "parse")]
+    wanted_types = ["GroceryStore"]
+    custom_settings = {
+        "DOWNLOAD_HANDLERS": {"https": "scrapy.core.downloader.handlers.http2.H2DownloadHandler"},
+        "RETRY_EXCEPTIONS": RETRY_EXCEPTIONS + [ProtocolError],
+        "USER_AGENT": FIREFOX_LATEST,
+        "DEFAULT_REQUEST_HEADERS": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,de-DE;q=0.8,de;q=0.7",
+        },
+    }
+
+    categories = {
+        "Netto City": Categories.SHOP_SUPERMARKET,
+        "Netto Getränke-Discount": Categories.SHOP_BEVERAGES,
+        "Netto Marken-Discount": Categories.SHOP_SUPERMARKET,
+    }
+
+    def post_process_item(self, item: Feature, response: Response, ld_data: dict, **kwargs):
+        item["website"] = response.url
+        item["brand"] = item["name"] = ld_data["name"].split(" - ", 1)[0]
+        if cat := self.categories.get(item["brand"]):
+            apply_category(cat, item)
+        else:
+            self.crawler.stats.inc_value("{}/unknown_type/{}".format(self.name, item["brand"]))
+            self.logger.error("Unknown type: {}".format(ld_data["name"]))
+
+        yield item

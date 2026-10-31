@@ -1,0 +1,29 @@
+from typing import Any, AsyncIterator
+
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
+
+from locations.categories import Categories, apply_category
+from locations.dict_parser import DictParser
+
+
+class TommyHRSpider(Spider):
+    name = "tommy_hr"
+    item_attributes = {"brand": "Tommy", "brand_wikidata": "Q12643718"}
+
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        yield JsonRequest(url="https://spiza.tommy.hr/api/v2/shop/channels?itemsPerPage=500")
+
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for store in response.json()["hydra:member"]:
+            item = DictParser.parse(store["location"])
+            item["name"] = "Tommy {}".format(store["storeType"])
+            item["ref"] = store["storeCode"]
+            item["lat"] = store["position"]["latitude"]
+            item["lon"] = store["position"]["longitude"]
+            item["state"] = store["location"]["provinceName"]
+            if store["storeType"] == "Market":
+                apply_category(Categories.SHOP_CONVENIENCE, item)
+            else:
+                apply_category(Categories.SHOP_SUPERMARKET, item)
+            yield item

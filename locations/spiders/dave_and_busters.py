@@ -1,87 +1,34 @@
-# -*- coding: utf-8 -*-
-import scrapy
-import json
-import re
+from typing import AsyncIterator
 
-DAYS=['Mo','Tu','We','Th','Fr','Sa','Su']
+from chompjs import parse_js_object
+from scrapy import Spider
+from scrapy.http import JsonRequest
 
-from locations.items import GeojsonPointItem
-class DaveAndBustersSpider(scrapy.Spider):
+from locations.dict_parser import DictParser
+from locations.pipelines.address_clean_up import clean_address
+
+
+class DaveAndBustersSpider(Spider):
     name = "dave_and_busters"
-    item_attributes = { 'brand': "Dave and Busters" }
-    allowed_domains = ["daveandbusters.com"]
-    start_urls = (
-        'https://www.daveandbusters.com/locations',
-    )
+    item_attributes = {"brand_wikidata": "Q5228205"}
+    allowed_domains = ["www.daveandbusters.com"]
+    start_urls = ["https://www.daveandbusters.com/content/dnb-request/datadetails.json?mode=location"]
 
-    def store_hours(self, store_hours):
-        res=''
-        for day in store_hours:
-            match = re.search(r'(\w*)(\s*-\s*(\w*))?\s*(\d{1,2})(:(\d{1,2}))?\s*(am|pm|mp)?\s*-\s*(\d{1,2})(:(\d{1,2}))?\s*(am|pm|mp)',day.replace('Midnight','12:00pm'))
-
-            if not match:
-                continue
-            res += match[1][:2]
-            
-            try:
-                res += match[2].replace(' ','')[:3]+' '
-            except Exception:
-                res += ' '
-
-            if match[5]:
-                first_minutes=match[5]
-            else:
-                first_minutes=':00'
-
-            if match[9]:
-                second_minutes=match[9]
-            else:
-                second_minutes=':00'
-                    
-            res += str(int(match[4])+(12 if match[7] in ['pm','mp'] else 0)) +first_minutes+'-'
-            res += str(int(match[8])+(12 if match[10] in ['pm','mp'] else 0)) +second_minutes+';'
-
-        return res.rstrip(';').strip()
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        for url in self.start_urls:
+            yield JsonRequest(url=url)
 
     def parse(self, response):
-        cities=response.xpath('//div[@class="location-list-item"]//li/a/@href')
-        for place in cities:
-            yield scrapy.Request(response.urljoin(place.extract()), callback=self.parse_shop)
+        # Returned JSON object is malformed
+        for location in parse_js_object(response.text)["locations"]:
+            if location["isComingSoon"]:
+                continue
+            if "COMING SOON" in location["name"].upper():
+                continue
 
+            location["address"]["street_address"] = clean_address(
+                [location["address"].pop("line1"), location["address"].pop("line2")]
+            )
+            location["website"] = location.pop("websiteUrl")
 
-    def parse_shop(self, response):
-
-        times = self.store_hours(response.xpath('//div[contains(@class,"schedule")]/p/text()').extract())
-        address =re.search(r'(.*),\s*(\D{2})\s*(\d{5})',response.xpath('//div[contains(@class,"location")]/p[3]/text()').extract_first())
-
-        props = {
-            'opening_hours' : times,
-            'phone' : response.xpath('//a[contains(@class,"dnb-local-info-phone")]/@href').extract_first().replace('tel:',''),
-            'website' : response.url,
-            'ref' : response.xpath('//div[contains(@class,"location")]/p[1]/text()').extract_first(),
-            'addr_full' : response.xpath('//div[contains(@class,"location")]/p[2]/text()').extract_first(),
-            }
-
-        try:
-            props['postcode'] = address[3]
-        except Exception as e:
-            postcode=''
-
-        try:
-            props['city'] = address[1]
-        except Exception as e:
-            city=''
-
-        try:
-            props['state'] = address[2]
-        except Exception as e:
-            state=''
-
-        try:
-            pos = json.loads(response.xpath('//head/script[@type="application/ld+json"]/text()').extract_first())['geo']
-            props['lat'] = float(pos['latitude'])
-            props['lon'] = float(pos['longitude'])
-        except Exception as e:
-            pos=''
-
-        yield GeojsonPointItem(**props)
+            yield DictParser.parse(location)

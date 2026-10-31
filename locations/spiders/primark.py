@@ -1,96 +1,57 @@
-# -*- coding: utf-8 -*-
-import scrapy
 import re
-from locations.items import GeojsonPointItem
-import json
-# import unicodedata
+
+from scrapy.http import Response
+from scrapy.spiders import SitemapSpider
+
+from locations.categories import Categories, apply_category
+from locations.items import Feature
+from locations.structured_data_spider import StructuredDataSpider
+from locations.user_agents import FIREFOX_LATEST
 
 
-class PrimarkSpider(scrapy.Spider):
+class PrimarkSpider(SitemapSpider, StructuredDataSpider):
     name = "primark"
-    item_attributes = { 'brand': "Primark" }
-    allowed_domains = ["primark.com"]
-    start_urls = (
-        'https://www.primark.com/en/our-stores',
-    )
+    item_attributes = {"brand": "Primark", "brand_wikidata": "Q137023"}
+    sitemap_urls = ["https://www.primark.com/robots.txt"]
+    sitemap_rules = [
+        # Root sitemap should be a sitemap index, normal sitemap
+        ("sitemap-store-locator.xml", "_parse_sitemap"),
+        # We need to have languages in here to avoid multilingual duplicates
+        (r"/de-at/stores/[^/]+/[^/]+$", "parse"),
+        (r"/nl-be/stores/[^/]+/[^/]+$", "parse"),
+        (r"/cs-cz/stores/[^/]+/[^/]+$", "parse"),
+        (r"/de-de/stores/[^/]+/[^/]+$", "parse"),
+        (r"/es-es/stores/[^/]+/[^/]+$", "parse"),
+        (r"/fr-fr/stores/[^/]+/[^/]+$", "parse"),
+        (r"/en-gb/stores/[^/]+/[^/]+$", "parse"),
+        (r"/en-ie/stores/[^/]+/[^/]+$", "parse"),
+        (r"/it-it/stores/[^/]+/[^/]+$", "parse"),
+        (r"/nl-nl/stores/[^/]+/[^/]+$", "parse"),
+        (r"/pl-pl/stores/[^/]+/[^/]+$", "parse"),
+        (r"/pt-pt/stores/[^/]+/[^/]+$", "parse"),
+        (r"/ro-ro/stores/[^/]+/[^/]+$", "parse"),
+        (r"/sl-si/stores/[^/]+/[^/]+$", "parse"),
+        (r"/sk-sk/stores/[^/]+/[^/]+$", "parse"),
+        (r"/en-us/stores/[^/]+/[^/]+$", "parse"),
+    ]
+    custom_settings = {"USER_AGENT": FIREFOX_LATEST}
+    requires_proxy = True
 
-    def parse_osm(self,opening_table):
+    def post_process_item(self, item: Feature, response: Response, ld_data: dict, **kwargs):
+        item["image"] = None
+        item["website"] = response.url
+        for k in item.fields.keys():
+            if item.get(k) == "{{placeholder}}":
+                item[k] = None
 
-        for div in opening_table:
-            opening_days = div.xpath('//span[@class="opening-day"]/text()').extract()
-            opening_hours = div.xpath('//span[@class="opening-hours text-turquoise"]/text()').extract()
-        
-        dayhour_list = list(zip(opening_days[:7], opening_hours[:7]))
-        dayhour_list.append(dayhour_list.pop(0)) # moving sunday to end of list
+        item["branch"] = item.pop("name").removeprefix("Primark ").removeprefix("Penneys ")
 
-        hoursdict = {}
-        for dayhour in dayhour_list:
-            if dayhour[1] not in hoursdict:
-                hoursdict[dayhour[1]] = []
+        item["state"] = None
+        item["country"] = response.url.split("/")[3].split("-")[1]
+        if m := re.search(
+            r'\\"displayCoordinate\\":{\\"latitude\\":(-?\d+\.\d+),\\"longitude\\":(-?\d+\.\d+)', response.text
+        ):
+            item["lat"], item["lon"] = m.groups()
 
-        for dayhour in dayhour_list:
-            hoursdict[dayhour[1]].append(dayhour[0])
-
-        osm = ""
-        for x in hoursdict:
-            if (hoursdict[x][0] == hoursdict[x][-1]):
-                osm += hoursdict[x][0] + " " + x + ", "
-            else:
-                osm += hoursdict[x][0] + "-" + hoursdict[x][-1] + " " + x + ", "
-        osm = osm[:-2]
-
-        day_dict = {'Monday':'Mo', 'Tuesday':'Tu', 'Wednesday':'We', 'Thursday':'Th', 'Friday':'Fr', 'Saturday':'Sa', 'Sunday':'Su'}
-        pattern = re.compile(r'\b(' + '|'.join(day_dict.keys()) + r')\b')
-        osm = pattern.sub(lambda x: day_dict[x.group()], osm.replace(" - ", "-"))
-
-        return osm
-
-    def parse(self, response):
-        raw_JSON = re.search(r'showMarks\(\$\.parseJSON\(\'(.*)\'\)\);', response.text)
-        dataJSON = json.loads(raw_JSON.group(1))
-
-        for i in range(int(len(dataJSON))):
-            link = "https://www.primark.com/en/store/" + dataJSON[i]['Name'].lower().strip().replace(' – ', '-').replace(' - ', '-').replace(' ', '-').replace('\'','').replace('(','').replace(')','').replace(',', '')
-            request = scrapy.Request(link, dont_filter=True, callback=self.parse_store, errback=self.handle_fail)
-            yield request
-
-    def handle_fail(self,failure):
-        pass
-
-    def parse_store(self,response):
-
-        address = (' '.join(response.css('h2.store-address').xpath('text()').extract())).lstrip().rstrip()
-        name = ''.join(response.css('div.store-info-text h1.title-level-1').xpath('text()').extract())
-        opening_hours = self.parse_osm(response.css('div.opening-times-table div.opening-day-hours'))
-        lat, lon = response.xpath('//div[@class="store-location-map"]/a/@href').extract()[0].split('?q=')[1].split(',')
-        website = response.url
-
-        postcode = ''
-        postmatch = re.search(r'[\d]{5}', address)
-        if postmatch:
-            postcode = postmatch.group(0)
-
-        phone = ''
-        phonematch = response.css('div.phone-number a.title-level-3').xpath('text()')
-        if phonematch:
-            phone = phonematch.extract()[0].replace("Tel: ","")
-
-
-        properties = {
-            'name': name,
-            'addr_full' : address,
-            'ref': name,
-            'website' : website,
-            # 'street': street,
-            # 'city': city,
-            # 'state' : statezip[:2],
-            'postcode' : postcode,
-            'opening_hours': opening_hours,
-            'phone': phone,
-            'lat': lat,
-            'lon': lon,
-        }
-
-        yield (GeojsonPointItem(**properties))
-
-        
+        apply_category(Categories.SHOP_CLOTHES, item)
+        yield item

@@ -1,0 +1,136 @@
+from typing import Any, AsyncIterator
+from urllib.parse import urljoin
+
+from scrapy import Spider
+from scrapy.http import JsonRequest, Response
+
+from locations.categories import Categories, Extras, apply_category, apply_yes_no
+from locations.dict_parser import DictParser
+from locations.hours import OpeningHours
+from locations.items import Feature
+
+
+class RenaultSpider(Spider):
+    name = "renault"
+
+    PAGE_SIZE = 100
+
+    BRANDS = {
+        "renault": {"brand": "Renault", "brand_wikidata": "Q6686"},
+        "dacia": {"brand": "Dacia", "brand_wikidata": "Q27460"},
+        "alpine": {"brand": "Alpine", "brand_wikidata": "Q26944"},
+    }
+
+    def make_request(self, host: str, page: int = 0) -> JsonRequest:
+        return JsonRequest(urljoin(host, "/wired/commerce/v1/dealers?page={}&pageSize={}".format(page, self.PAGE_SIZE)))
+
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        yield self.make_request("https://www.renault.nl/")
+        yield self.make_request("https://www.dacia.fr/")
+        yield self.make_request("https://www.alpinecars.de/")
+        yield self.make_request("https://www.renault.co.in/")
+        yield self.make_request("https://www.renault.com.br/")
+
+    def parse(self, response: Response, **kwargs: Any) -> Any:
+        for location in response.json()["data"]:
+            if not location["active"] or location["blacklisted"]:
+                continue
+            item = DictParser.parse(location)
+            item["ref"] = location["dealerId"]
+            item["lat"] = location.get("geolocalization", {}).get("lat")
+            item["lon"] = location.get("geolocalization", {}).get("lon")
+            item["street_address"] = location["extendedAddress"] or location["streetAddress"]
+            item["country"] = location.get("country")
+            item["phone"] = location["telephone"].get("value")
+
+            activities = [activity["birId"] for activity in location["dealerActivities"]]
+
+            # TODO?
+            # 00 "Main Service"
+            # 02 "Renault Business Center"
+            # 04 "Mechanical Workshop"
+            # 06 "Renault Assistance"
+            # 07 "Renault Minute Service"
+            # 09 "Pro+ Center"
+            # 11 "Renault Boutique"
+            # 12 "Renault Rent"
+            # 13 "Renault Finance"
+            # 14 "Renault Sport"
+            # 16 "Leasing"
+            # 18 "Electric vehicle sales"
+            # 19 "New Vehicle Delivery"
+            # 20 "Courtesy Vehicle"
+            # 21 "After Sales E.V."
+            # 25 "E-commerce"
+            # 56 "Renault Mobility"
+            # 70 "E-Commerce"
+            # 72 "Dacia Corner"
+            # 89 "Renault Selection"
+            # 278 "Renew Occasions Renault"
+            # 359 "Borne de Recharge 24/7"
+            # location["type"]
+            # location["dealerNature"]
+
+            for key, brand in self.BRANDS.items():
+                if location.get(key) and not location[key]["blacklisted"]:
+                    is_dealer = "01" in activities
+                    is_service = "04" in activities
+                    is_parts = "10" in activities
+                    if is_dealer:
+                        sales_item = self.create_shop_item(item, key, brand)
+                        sales_item["opening_hours"] = self.parse_hours(location[key], "01")
+                        apply_yes_no(Extras.VEHICLE_USED_CAR_SALES, sales_item, "03" in activities)
+                        yield sales_item
+                    if is_service:
+                        service_item = self.create_service_item(item, key, brand)
+                        service_item["opening_hours"] = self.parse_hours(location[key], "04")
+                        apply_yes_no(Extras.VEHICLE_INSPECTION_SERVICES, service_item, "17" in activities)
+                        yield service_item
+                    if is_parts:
+                        parts_item = self.create_parts_item(item, key, brand)
+                        parts_item["opening_hours"] = self.parse_hours(location[key], "10")
+                        yield parts_item
+
+        if response.json()["currentPage"] < response.json()["totalPages"]:
+            yield self.make_request(response.url, response.json()["currentPage"] + 1)
+
+    @staticmethod
+    def parse_hours(brand_data: dict, activity: str) -> OpeningHours | None:
+        for sheet in brand_data.get("activityTimeSheet") or []:
+            if sheet["activityBirId"] != activity:
+                continue
+            oh = OpeningHours()
+            for day, slots in sheet["dayOfWeekTimeSlot"].items():
+                periods = [slots[part] for part in ("morning", "afternoon") if slots and slots.get(part)]
+                if not periods:
+                    oh.set_closed(day)
+                for period in periods:
+                    opening, closing = period["openingTime"], period["closingTime"]
+                    oh.add_range(
+                        day,
+                        "{:02d}:{:02d}".format(opening["hour"], opening["minutes"]),
+                        "{:02d}:{:02d}".format(closing["hour"], closing["minutes"]),
+                    )
+            return oh
+        return None
+
+    def create_shop_item(self, item: Feature, key: str, brand: dict) -> Feature:
+        shop = item.deepcopy()
+        shop["ref"] = "{}-{}".format(item["ref"], key)
+        shop.update(brand)
+        apply_category(Categories.SHOP_CAR, shop)
+        return shop
+
+    def create_service_item(self, item: Feature, key: str, brand: dict) -> Feature:
+        service = item.deepcopy()
+        service["ref"] = "{}-{}_service".format(item["ref"], key)
+        service.update(brand)
+        apply_category(Categories.SHOP_CAR_REPAIR, service)
+        return service
+
+    def create_parts_item(self, item: Feature, key: str, brand: dict) -> Feature:
+        parts = item.deepcopy()
+        parts["ref"] = "{}-{}_parts".format(item["ref"], key)
+        parts.update(brand)
+        apply_category(Categories.SHOP_CAR_PARTS, parts)
+        return parts

@@ -1,74 +1,53 @@
-import scrapy
-from locations.items import GeojsonPointItem
-import json
-import re
-from io import StringIO
-from scrapy.http import HtmlResponse
-from functools import partial
-from datetime import datetime
+from typing import AsyncIterator
 
-default_headers = {
-    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_1) AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/63.0.3239.84 Safari/537.36"}
+from scrapy import Spider
+from scrapy.http import JsonRequest, Request
+
+from locations.dict_parser import DictParser
+from locations.hours import OpeningHours
+from locations.pipelines.address_clean_up import merge_address_lines
 
 
-def get_hours(hour_list):
-    try:
-        ret = []
-        for hours in hour_list:
-            open_time = datetime.strptime(hours["hours"]["open"], "%I:%M %p").strftime("%H:%M")
-            close_time = datetime.strptime(hours["hours"]["close"], "%I:%M %p").strftime("%H:%M")
-            split_days = hours["days"].split(" - ")
-            if "-" in hours["days"] and len(split_days) == 2:
-                start_day, end_day = split_days
-                ret.append("{} {}-{}".format("-".join([start_day[:2], end_day[:2]]), open_time, close_time))
-            else:
-                ret.append("{} {}-{}".format(hours["days"][:2], open_time, close_time))
-        return "; ".join(ret)
-    except:
-        return None
-
-
-class SuperCutsScraper(scrapy.Spider):
+class SupercutsSpider(Spider):
     name = "supercuts"
-    item_attributes = { 'brand': "Supercuts" }
+    item_attributes = {"brand": "Supercuts", "brand_wikidata": "Q7643239"}
+    allowed_domains = ["api.regiscorp.com"]
 
-    start_urls = [
-        'https://www.supercuts.com/salon-directory.html'
-    ]
+    async def start(self) -> AsyncIterator[JsonRequest]:
+        yield JsonRequest(
+            "https://api.regiscorp.com/sis/api/salon/get-states-by-brand?brand=sc",
+            callback=self.parse_index,
+        )
 
-    def parse(self, response):
-        states = [x.xpath("@href").extract_first() for x in response.css("a[href*='supercuts.com/locations/']")]
-        for state_url in states:
-            yield scrapy.Request(state_url, callback=self.parse_cities)
+    def parse_index(self, response):
+        for country in response.json().values():
+            for state in country:
+                st = state["state_abbreviation"].lower()
+                yield JsonRequest(
+                    "https://api.regiscorp.com/sis/api/salon/search-by-location?brand=sc&state={}".format(st),
+                    callback=self.parse_state,
+                )
 
-    def parse_cities(self, response):
-        cities = [x.xpath("@href").extract_first() for x in response.css("a[href*='locations/']")]
-        for city_url in cities:
-            yield scrapy.Request(response.urljoin(city_url), callback=self.parse_locations)
+    def parse_state(self, response):
+        for salon in response.json():
+            yield Request(
+                url="https://api.regiscorp.com/sis/api/salon?salon-number={}".format(int(salon["salonId"])),
+                callback=self.parse_salon,
+            )
 
-    def parse_locations(self, response):
-        locations = [x.xpath("@href").extract_first() for x in response.css("a[href*='locations/']")]
-        salon_base = "https://info3.regiscorp.com/salonservices/siteid/1/salon/{}"
-        for location in locations:
-            salon_id = location.strip(".html").split("-")[-1]
-            if salon_id.isnumeric():
-                yield scrapy.Request(salon_base.format(salon_id),
-                                     callback=partial(self.parse_result, trunk={"url": response.urljoin(location)}))
-
-    def parse_result(self, response, trunk={}):
-        result = json.loads(response.body_as_unicode())
-        if result.get("name"):
-            name = "Supercuts " + result["name"].title()
-            yield GeojsonPointItem(lat=result["latitude"],
-                                   lon=result["longitude"],
-                                   name=name,
-                                   addr_full=result["address"],
-                                   city=result["city"],
-                                   state=result["state"],
-                                   postcode=result["zip"],
-                                   phone=result["phonenumber"],
-                                   website=trunk["url"],
-                                   opening_hours=get_hours(result["store_hours"]),
-                                   ref=response.url.split("/")[-1]
-                                   )
+    def parse_salon(self, response):
+        data = response.json()
+        item = DictParser.parse(data)
+        item["ref"] = data["salon_number"]
+        item["branch"] = (
+            item.pop("name").replace(str(data["salon_number"]) + "-", "").replace(str(data["salon_number"]) + " - ", "")
+        )
+        if address2 := data["address2"]:
+            item["street_address"] = merge_address_lines([item["street_address"], address2])
+        item["website"] = data["booking_url"]
+        item["opening_hours"] = OpeningHours()
+        for day, time in data["store_hours"].items():
+            open_time = time["open"]
+            close_time = time["close"]
+            item["opening_hours"].add_range(day=day, open_time=open_time, close_time=close_time, time_format="%I:%M %p")
+        yield item

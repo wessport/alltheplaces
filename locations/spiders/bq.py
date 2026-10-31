@@ -1,47 +1,43 @@
-# -*- coding: utf-8 -*-
 import scrapy
-import json
-import re
 
-from locations.items import GeojsonPointItem
+from locations.dict_parser import DictParser
+from locations.hours import OpeningHours
+from locations.pipelines.address_clean_up import clean_address
 
 
-class BQSpider(scrapy.Spider):
+class BqSpider(scrapy.Spider):
     name = "bq"
-    item_attributes = { 'brand': "B&Q" }
-    allowed_domains = ['www.diy.com']
+    item_attributes = {"brand": "B&Q", "brand_wikidata": "Q707602"}
+    allowed_domains = ["www.diy.com"]
     # To get a new atmosphere_app_id key, check Network calls within https://www.diy.com/find-a-store/ (call to api.kingfisher.com)
-    start_urls = (
-        'https://api.kingfisher.com/v1/mobile/stores/BQUK?nearLatLong=51.515617%2C-0.091998&page[size]=500&atmosphere_app_id=kingfisher-7c4QgmLEROp4PUh0oUebbI94',
-    )
+    custom_settings = {
+        "DEFAULT_REQUEST_HEADERS": {"Authorization": "Atmosphere atmosphere_app_id=kingfisher-7c4QgmLEROp4PUh0oUebbI94"}
+    }
 
+    start_urls = ("https://api.kingfisher.com/v1/mobile/stores/BQUK?nearLatLong=51.515617%2C-0.091998&page[size]=500",)
 
     def parse(self, response):
-        response.selector.remove_namespaces()
+        for data in response.json()["data"]:
+            store = data["attributes"]["store"]
 
-        data = json.loads( response.xpath('//text()').get() )['data']
+            store["contact"] = store.pop("contactPoint")
+            store["location"] = store["geoCoordinates"].pop("coordinates")
 
-        for store in data:
-            if store['type'] == 'store':
-                try:
+            item = DictParser.parse(store)
 
-                    country = store['attributes']['store']['geoCoordinates']['country']
-                    country = 'Ireland' if country == 'Eire' else country
+            item["ref"] = data["id"]
+            item["website"] = "https://www.diy.com/store/" + item["ref"]
 
-                    properties = {
-                        'name': store['attributes']['store']['name'],
-                        'ref': store['id'],
-                        'website': 'https://www.diy.com{}'.format( store['attributes']['seoPath'] ),
-                        'postcode': store['attributes']['store']['geoCoordinates']['postalCode'],
-                        'city': store['attributes']['store']['geoCoordinates']['address']['lines'][-2],
-                        'country': country,
-                        'addr_full': store['attributes']['store']['geoCoordinates']['address']['lines'][0],
-                        'phone': store['attributes']['store']['contactPoint']['telephone'],
-                        'lat': float(store['attributes']['store']['geoCoordinates']['latitude']),
-                        'lon': float(store['attributes']['store']['geoCoordinates']['longitude'])
-                    }
+            item["country"] = store["geoCoordinates"]["countryCode"]
+            item["postcode"] = store["geoCoordinates"]["postalCode"]
 
-                    yield GeojsonPointItem(**properties)
+            item["addr_full"] = clean_address(store["geoCoordinates"]["address"]["lines"])
+            item["street_address"] = clean_address(store["geoCoordinates"]["address"]["lines"][:3])
+            oh = OpeningHours()
+            for rule in store["openingHoursSpecifications"]:
+                if not rule.get("opens"):
+                    continue
+                oh.add_range(rule["dayOfWeek"], rule["opens"][:5], rule["closes"][:5])
+            item["opening_hours"] = oh
 
-                except:
-                    break
+            yield item
